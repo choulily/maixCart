@@ -1,0 +1,22 @@
+#https://wiki.sipeed.com/soft/maixpy/zh/modules/on_chip/pwm.html
+#导入库文件 包括IO映射和PWM库
+from machine import Timer, PWM
+import time
+
+#pin21和pin22可控制Motor_A电机正反转和PWM调速
+#给每个PWM设定一个定时器频道
+tim1 = Timer(Timer.TIMER0, Timer.CHANNEL0, mode=Timer.MODE_PWM)
+PWM1 = PWM(tim1, freq=500000, duty=50, pin=21)
+tim2 = Timer(Timer.TIMER0, Timer.CHANNEL1, mode=Timer.MODE_PWM)
+PWM2 = PWM(tim2, freq=500000, duty=50, pin=22)
+
+while True:
+    PWM1.duty(0)
+    PWM2.duty(80)
+    time.sleep(1)             #正转一秒，PWM设为100(0-100可调)
+    PWM1.duty(80)
+    PWM2.duty(0)
+    time.sleep(1)             #反转一秒
+    PWM1.duty(0)
+    PWM2.duty(0)
+    time.sleep(1)             #停一秒

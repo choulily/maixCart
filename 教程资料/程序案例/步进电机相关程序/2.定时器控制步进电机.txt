@@ -1,0 +1,36 @@
+#https://wiki.sipeed.com/soft/maixpy/zh/api_reference/machine/timer.html
+#######################################################################
+import time
+from machine import Timer, PWM
+#from machine import Pin
+
+from maix import GPIO  #烧录‘K210固件’
+#from Maix import GPIO  #烧录‘垃圾识别固件’
+from fpioa_manager import fm
+
+#将21 22注册为GPIO功能
+fm.register(21,fm.fpioa.GPIO0)
+fm.register(22,fm.fpioa.GPIO1)
+
+# 定义控制引脚
+dir_pin = GPIO(GPIO.GPIO0, GPIO.OUT)
+step_pin = GPIO(GPIO.GPIO1, GPIO.OUT)
+
+
+def Step_callback(Timer):
+    step_pin.value(1)
+    step_pin.value(0)
+
+# 初始化定时器，以指定的间隔调用 step_callback 函数
+tim = Timer(Timer.TIMER0, Timer.CHANNEL0, mode=Timer.MODE_PERIODIC, period=1, unit=Timer.UNIT_MS, callback=Step_callback, arg=None, start=False, priority=1, div=0)
+#  period为1，代表1毫秒控制一步1.8°
+while True:
+    # 正转一圈
+    dir_pin.value(1)#正转
+    tim.start()
+    time.sleep(1)  # 暂停 1 秒
+    # 反转一圈
+    dir_pin.value(0) #反转
+    time.sleep(1)  # 暂停 1 秒
+    tim.stop()
+    time.sleep(1)

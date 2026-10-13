@@ -1,0 +1,40 @@
+import time
+#from machine import Pin
+
+#GPIO的操作与固件相关 不同固件import Maix(maix)有区别
+from maix import GPIO  #烧录‘K210固件’
+#from Maix import GPIO  #烧录‘垃圾识别固件’
+from fpioa_manager import fm
+
+#将21 22注册为GPIO功能
+fm.register(21,fm.fpioa.GPIO0)
+fm.register(22,fm.fpioa.GPIO1)
+
+# 定义控制引脚
+dir_pin = GPIO(GPIO.GPIO0, GPIO.OUT)
+step_pin = GPIO(GPIO.GPIO1, GPIO.OUT)
+
+# 定义步进电机每圈步数，42步进1.8°一步，200步正好为360°
+steps_per_revolution = 200
+
+# 定义脉冲间隔时间（单位：毫秒），可根据需要调整
+pulse_interval = 1 #这个值需要和脉冲间隔时间匹配，调整的话，需要*2的倍数
+
+def rotate_motor(steps, direction):
+    # 设置方向
+    dir_pin.value(direction)
+    for _ in range(steps):
+        # 产生脉冲信号
+        step_pin.value(1)
+        time.sleep_ms(pulse_interval)
+        step_pin.value(0)
+        time.sleep_ms(pulse_interval)
+
+while True:
+    # 正转一圈
+    rotate_motor(steps_per_revolution, 1)
+    time.sleep(1)  # 暂停 1 秒
+
+    # 反转一圈
+    rotate_motor(steps_per_revolution, 0)
+    time.sleep(1)  # 暂停 1 秒

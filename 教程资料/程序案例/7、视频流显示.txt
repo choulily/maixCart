@@ -1,0 +1,18 @@
+import sensor, image, time, lcd
+
+lcd.init(freq=15000000)
+sensor.reset()                      # Reset and initialize the sensor. It will
+sensor.set_hmirror(1)      #摄像头水平镜像，0为关闭，1为开启，不同店买的ov2640摄像头方向各不相同，本店购买，无需修改
+sensor.set_vflip(1)        #摄像头垂直镜像，0为关闭，1为开启
+#！！特别提示：由于广角摄像头出厂批次原因，如果图像反了，就需要镜像一下，将0设置为1
+sensor.set_pixformat(sensor.RGB565) # Set pixel format to RGB565 (or GRAYSCALE)
+sensor.set_framesize(sensor.QVGA)   # Set frame size to QVGA (320x240)
+sensor.skip_frames(time = 2000)     # Wait for settings take effect.
+clock = time.clock()                # Create a clock object to track the FPS.
+
+while(True):
+    clock.tick()                    # Update the FPS clock.
+    img = sensor.snapshot()         # Take a picture and return the image.
+    lcd.display(img)                # Display on LCD
+    print(clock.fps())              # Note: MaixPy's Cam runs about half as fast when connected
+                                    # to the IDE. The FPS should increase once disconnected.

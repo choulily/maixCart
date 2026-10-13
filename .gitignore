@@ -1,0 +1,16 @@
+# ---- generated / local-only ----
+__pycache__/
+*.py[cod]
+
+# GUI saved settings: WiFi SSID + password, machine specific - never push
+tools/.remote_gui.json
+
+# LibreOffice lock files
+.~lock.*#
+
+# ---- vendor installers in 教程资料/ (too big for GitHub) ----
+# IDE installers (~450 MB) and the kflash tool installers; the rest of the
+# tutorial material (sample programs, firmware, models, PDFs, images) is kept.
+教程资料/软件ide/
+教程资料/kflash_gui_v1.8.2_linux_glibc2.28.AppImage
+教程资料/kflash_gui_v1.8.1_windows/

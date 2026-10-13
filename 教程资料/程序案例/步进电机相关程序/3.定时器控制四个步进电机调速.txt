@@ -1,0 +1,97 @@
+#https://wiki.sipeed.com/soft/maixpy/zh/api_reference/machine/timer.html
+#######################################################################
+import time
+from machine import Timer, PWM
+#from machine import Pin
+
+from maix import GPIO  #烧录‘K210固件’
+#from Maix import GPIO  #烧录‘垃圾识别固件’
+from fpioa_manager import fm
+
+#将21 22注册为GPIO功能
+fm.register(21,fm.fpioa.GPIO0)
+fm.register(22,fm.fpioa.GPIO1)
+fm.register(23,fm.fpioa.GPIO2)
+fm.register(24,fm.fpioa.GPIO3)
+fm.register(32,fm.fpioa.GPIO4)
+fm.register(15,fm.fpioa.GPIO5)
+fm.register(14,fm.fpioa.GPIO6)
+fm.register(13,fm.fpioa.GPIO7)
+
+# 定义控制引脚
+dir_pin_0 = GPIO(GPIO.GPIO0, GPIO.OUT)
+step_pin_0 = GPIO(GPIO.GPIO1, GPIO.OUT)
+dir_pin_1 = GPIO(GPIO.GPIO2, GPIO.OUT)
+step_pin_1 = GPIO(GPIO.GPIO3, GPIO.OUT)
+dir_pin_2 = GPIO(GPIO.GPIO4, GPIO.OUT)
+step_pin_2 = GPIO(GPIO.GPIO5, GPIO.OUT)
+dir_pin_3 = GPIO(GPIO.GPIO6, GPIO.OUT)
+step_pin_3 = GPIO(GPIO.GPIO7, GPIO.OUT)
+
+
+# 定义每个步进电机的调速参数
+# 表示每隔多少个定时器周期产生一个步进脉冲
+step_interval_0 = 1
+step_interval_1 = 2
+step_interval_2 = 3
+step_interval_3 = 4
+# 计数器，记录定时器触发次数
+counter_0 = 0
+counter_1 = 0
+counter_2 = 0
+counter_3 = 0
+
+def Step_callback(Timer):
+    global counter_0, counter_1, counter_2, counter_3
+    # 步进电机 0
+    counter_0 += 1
+    if counter_0 >= step_interval_0:
+        step_pin_0.value(1)
+        step_pin_0.value(0)
+        counter_0 = 0
+
+    # 步进电机 1
+    counter_1 += 1
+    if counter_1 >= step_interval_1:
+        step_pin_1.value(1)
+        step_pin_1.value(0)
+        counter_1 = 0
+
+    # 步进电机 2
+    counter_2 += 1
+    if counter_2 >= step_interval_2:
+        step_pin_2.value(1)
+        step_pin_2.value(0)
+        counter_2 = 0
+
+    # 步进电机 3
+    counter_3 += 1
+    if counter_3 >= step_interval_3:
+        step_pin_3.value(1)
+        step_pin_3.value(0)
+        counter_3 = 0
+
+
+# 初始化定时器，以指定的间隔调用 step_callback 函数
+tim = Timer(Timer.TIMER0, Timer.CHANNEL0, mode=Timer.MODE_PERIODIC, period=1, unit=Timer.UNIT_MS, callback=Step_callback, arg=None, start=False, priority=1, div=0)
+
+#  period为1，代表1毫秒控制一步1.8°
+
+while True:
+    # 正转
+    dir_pin_0.value(0)
+    dir_pin_1.value(0)
+    dir_pin_2.value(0)
+    dir_pin_3.value(0)
+    tim.start()
+    time.sleep(1)  # 正转 3 秒
+
+    # 反转
+    dir_pin_0.value(1)
+    dir_pin_1.value(1)
+    dir_pin_2.value(1)
+    dir_pin_3.value(1)
+    time.sleep(1)  # 反转 3 秒
+
+    tim.stop()
+    time.sleep(1)  # 暂停 1 秒

@@ -1,0 +1,188 @@
+import sensor, image, time, lcd
+#from Maix import GPIO  #..
+from fpioa_manager import fm
+from machine import Timer, PWM
+
+#-------------------------------------------电机舵机设置------------------------------------------#
+tim1 = Timer(Timer.TIMER0, Timer.CHANNEL0, mode=Timer.MODE_PWM)
+PWM1 = PWM(tim1, freq=500000, duty=50, pin=21)
+tim2 = Timer(Timer.TIMER0, Timer.CHANNEL1, mode=Timer.MODE_PWM)
+PWM2 = PWM(tim2, freq=500000, duty=50, pin=22)
+tim3 = Timer(Timer.TIMER0, Timer.CHANNEL2, mode=Timer.MODE_PWM)
+PWM3 = PWM(tim3, freq=500000, duty=50, pin=23)
+tim4 = Timer(Timer.TIMER0, Timer.CHANNEL3, mode=Timer.MODE_PWM)
+PWM4 = PWM(tim4, freq=500000, duty=50, pin=24)
+tim5 = Timer(Timer.TIMER1, Timer.CHANNEL0, mode=Timer.MODE_PWM)
+PWM5 = PWM(tim5, freq=500000, duty=50, pin=15)
+tim6 = Timer(Timer.TIMER1, Timer.CHANNEL1, mode=Timer.MODE_PWM)
+PWM6 = PWM(tim6, freq=500000, duty=50, pin=32)
+tim7 = Timer(Timer.TIMER1, Timer.CHANNEL2, mode=Timer.MODE_PWM)
+PWM7 = PWM(tim7, freq=500000, duty=50, pin=14)
+tim8 = Timer(Timer.TIMER1, Timer.CHANNEL3, mode=Timer.MODE_PWM)
+PWM8 = PWM(tim8, freq=500000, duty=50, pin=13)
+def car_forward(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(0)
+    PWM2.duty(Motor_A)
+    PWM3.duty(0)
+    PWM4.duty(Motor_B)
+    PWM5.duty(0)
+    PWM6.duty(Motor_C)
+    PWM7.duty(0)
+    PWM8.duty(Motor_D)
+def car_backward(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(Motor_A)
+    PWM2.duty(0)
+    PWM3.duty(Motor_B)
+    PWM4.duty(0)
+    PWM5.duty(Motor_C)
+    PWM6.duty(0)
+    PWM7.duty(Motor_D)
+    PWM8.duty(0)
+def car_turn_left(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(Motor_A)
+    PWM2.duty(0)
+    PWM3.duty(0)
+    PWM4.duty(Motor_B)
+    PWM5.duty(Motor_C)
+    PWM6.duty(0)
+    PWM7.duty(0)
+    PWM8.duty(Motor_D)
+def car_turn_right(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(0)
+    PWM2.duty(Motor_A)
+    PWM3.duty(Motor_B)
+    PWM4.duty(0)
+    PWM5.duty(0)
+    PWM6.duty(Motor_C)
+    PWM7.duty(Motor_D)
+    PWM8.duty(0)
+def car_left(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(Motor_A)
+    PWM2.duty(0)
+    PWM3.duty(0)
+    PWM4.duty(Motor_B)
+    PWM5.duty(0)
+    PWM6.duty(Motor_C)
+    PWM7.duty(Motor_D)
+    PWM8.duty(0)
+def car_right(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(0)
+    PWM2.duty(Motor_A)
+    PWM3.duty(Motor_B)
+    PWM4.duty(0)
+    PWM5.duty(Motor_C)
+    PWM6.duty(0)
+    PWM7.duty(0)
+    PWM8.duty(Motor_D)
+
+last_angle_1 = 1
+last_angle_2 = 1
+last_angle_3 = 1
+last_angle_4 = 1
+Servo1_tim = Timer(Timer.TIMER2, Timer.CHANNEL0, mode=Timer.MODE_PWM)
+S1 = PWM(Servo1_tim, freq=50, duty=0, pin=12)
+Servo2_tim = Timer(Timer.TIMER2, Timer.CHANNEL1, mode=Timer.MODE_PWM)
+S2 = PWM(Servo2_tim, freq=50, duty=0, pin=11)
+Servo3_tim = Timer(Timer.TIMER2, Timer.CHANNEL2, mode=Timer.MODE_PWM)
+S3 = PWM(Servo3_tim, freq=50, duty=0, pin=10)
+Servo4_tim = Timer(Timer.TIMER2, Timer.CHANNEL3, mode=Timer.MODE_PWM)
+S4 = PWM(Servo4_tim, freq=50, duty=0, pin=3)
+def Servo_1(angle):
+    global last_angle_1
+    if last_angle_1 > angle:step = -1
+    else:step = 1
+    for i in range(last_angle_1,angle,step):
+        S1.duty((i+90)/180*10+2.5)
+        time.sleep(0.03)             #调节时间参数，改变缓动速度
+    last_angle_1 = angle
+def Servo_2(angle):
+    global last_angle_2
+    if last_angle_2 > angle:step = -1
+    else:step = 1
+    for i in range(last_angle_2,angle,step):
+        S2.duty((i+90)/180*10+2.5)
+        time.sleep(0.03)
+    last_angle_2 = angle
+def Servo_3(angle):
+    global last_angle_3
+    if last_angle_3 > angle:step = -1
+    else:step = 1
+    for i in range(last_angle_3,angle,step):
+        S3.duty((i+90)/180*10+2.5)
+        time.sleep(0.03)
+    last_angle_3 = angle
+def Servo_4(angle):
+    global last_angle_4
+    if last_angle_4 > angle:step = -1
+    else:step = 1
+    for i in range(last_angle_4,angle,step):
+        S4.duty((i+90)/180*10+2.5)
+        time.sleep(0.03)
+    last_angle_4 = angle
+#-------------------------------------------电机舵机设置------------------------------------------#
+
+
+#-------------------------------识别不同颜色的色块------------------------------------#
+def find_blob(color_threshold,roi_area):
+    img = sensor.snapshot()
+    blobs = img.find_blobs([color_threshold],roi=roi_area)  #roi为感兴趣区域，可以控制图像处理的区域
+    global b  #设为全局变量
+    if blobs:
+        for b in blobs:
+            if b[4] > 100:    #b[4]为像素点总数，这个判断用于去除一些不需要的干扰色块
+                tmp = img.draw_rectangle(b[0:4],color = (255, 255, 0))   #画框
+                tmp = img.draw_cross(b[5],b[6],color = (255, 255, 0))   #画像素中心点
+                print(b)
+                #print(b[4])  #b[4]是色块的像素点之和
+                #print(b[5])  #b[5]是色块中心点像素的x轴位置，可以用于巡线
+                #print(b[6])   #b[6]是色块中心点y轴位置，判断远近]
+    lcd.display(img)
+#-------------------------------识别不同颜色的色块------------------------------------#
+
+area = [0,0,320,280]  #视觉区域，可自行设定区域范围，全屏为340*240
+green_threshold = (0, 100, -128, -11, -128, 127)
+red_threshold = (0, 100, 22, 127, -27, 127)
+red_threshold = (0, 100, 22, 127, -27, 127)
+yellow_threshold = (93, 51, -128, 127, 26, 82)
+green_threshold = (15, 76, -128, -11, -128, 127)
+blue_threshold = (17, 68, -12, 31, -60, -13)
+pink_threshold = (54, 13, 22, 71, 49, 22)
+black_threshold = (0, 58, -128, 127, -128, 127)
+white_threshold = (100, 95, -128, 127, -128, 127)
+
+#------------------------------摄像头和液晶显示器初始化设定--------------------------------------#
+lcd.init()
+#lcd.rotation(3) #液晶屏翻转 1为90° 2为180° 3为270°
+sensor.reset()
+sensor.set_hmirror(1)      #摄像头水平镜像，0为关闭，1为开启，不同店买的ov2640摄像头方向各不相同，本店购买，无需修改
+sensor.set_vflip(1)        #摄像头垂直镜像，0为关闭，1为开启
+sensor.set_pixformat(sensor.RGB565)   #色彩
+sensor.set_framesize(sensor.QVGA)      #像素
+clock = time.clock()
+#------------------------------摄像头和液晶显示器初始化设定--------------------------------------#
+
+
+#启动后停车，舵机归位
+car_forward(0,0,0,0)
+Servo_1(0)
+Servo_2(50)
+Servo_3(-40)
+Servo_4(-30)
+
+
+while True:
+    clock.tick()
+    find_blob(red_threshold,area)
+    if b[4]<3000:
+        car_forward(55,55,55,55)
+    elif b[4]>4500:
+        car_backward(55,55,55,55)
+    else:
+        if b[5]<155:
+            car_left(55,55,55,55)
+        elif b[5]>165:
+            car_right(55,55,55,55)
+        else:
+            car_forward(0,0,0,0)
+    print("fps={}".format(clock.fps()))
+

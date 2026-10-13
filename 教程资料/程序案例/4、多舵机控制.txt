@@ -1,0 +1,44 @@
+from machine import Timer, PWM
+import time
+
+
+#给舵机1设定PWM定时器 pin12接舵机1
+Servo1_tim = Timer(Timer.TIMER2, Timer.CHANNEL0, mode=Timer.MODE_PWM)
+S1 = PWM(Servo1_tim, freq=50, duty=0, pin=12)
+#给舵机2设定PWM定时器 pin11接舵机2
+Servo2_tim = Timer(Timer.TIMER2, Timer.CHANNEL1, mode=Timer.MODE_PWM)
+S2 = PWM(Servo2_tim, freq=50, duty=0, pin=11)
+#给舵机3设定PWM定时器 pin10接舵机3
+Servo3_tim = Timer(Timer.TIMER2, Timer.CHANNEL2, mode=Timer.MODE_PWM)
+S3 = PWM(Servo3_tim, freq=50, duty=0, pin=10)
+#给舵机4设定PWM定时器 pin12接舵机4
+Servo4_tim = Timer(Timer.TIMER2, Timer.CHANNEL3, mode=Timer.MODE_PWM)
+S4 = PWM(Servo4_tim, freq=50, duty=0, pin=3)
+
+#-------------如果想使用4个以上舵机，请把拨码开关1-8，选择性向下拨动，即关闭电机控制，pwm和定时器使用电机的。
+#给舵机5设定PWM定时器 pin21接舵机1
+#Servo5_tim = Timer(Timer.TIMER0, Timer.CHANNEL0, mode=Timer.MODE_PWM)
+#S5 = PWM(Servo1_tim, freq=50, duty=0, pin=21)
+#def Servo_5(servo,angle):
+    #S5.duty((angle+90)/180*10+2.5)
+#---------------------#
+
+def Servo_1(angle):
+    S1.duty((angle+90)/180*10+2.5)
+def Servo_2(angle):
+    S2.duty((angle+90)/180*10+2.5)
+def Servo_3(angle):
+    S3.duty((angle+90)/180*10+2.5)
+def Servo_4(angle):
+    S4.duty((angle+90)/180*10+2.5)
+
+while True:
+    Servo_2(-30)
+    Servo_3(30)
+    time.sleep(1)
+    Servo_2(0)
+    Servo_3(0)
+    time.sleep(1)
+    Servo_2(30)
+    Servo_3(-30)
+    time.sleep(1)

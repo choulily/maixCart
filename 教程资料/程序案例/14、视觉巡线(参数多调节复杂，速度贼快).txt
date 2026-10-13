@@ -1,0 +1,184 @@
+import sensor, image, time, lcd
+#from Maix import GPIO
+from fpioa_manager import fm
+from machine import Timer, PWM
+
+#-------------------------------------------电机舵机设置------------------------------------------#
+tim1 = Timer(Timer.TIMER0, Timer.CHANNEL0, mode=Timer.MODE_PWM)
+PWM1 = PWM(tim1, freq=500000, duty=50, pin=21)
+tim2 = Timer(Timer.TIMER0, Timer.CHANNEL1, mode=Timer.MODE_PWM)
+PWM2 = PWM(tim2, freq=500000, duty=50, pin=22)
+tim3 = Timer(Timer.TIMER0, Timer.CHANNEL2, mode=Timer.MODE_PWM)
+PWM3 = PWM(tim3, freq=500000, duty=50, pin=23)
+tim4 = Timer(Timer.TIMER0, Timer.CHANNEL3, mode=Timer.MODE_PWM)
+PWM4 = PWM(tim4, freq=500000, duty=50, pin=24)
+tim5 = Timer(Timer.TIMER1, Timer.CHANNEL0, mode=Timer.MODE_PWM)
+PWM5 = PWM(tim5, freq=500000, duty=50, pin=15)
+tim6 = Timer(Timer.TIMER1, Timer.CHANNEL1, mode=Timer.MODE_PWM)
+PWM6 = PWM(tim6, freq=500000, duty=50, pin=32)
+tim7 = Timer(Timer.TIMER1, Timer.CHANNEL2, mode=Timer.MODE_PWM)
+PWM7 = PWM(tim7, freq=500000, duty=50, pin=14)
+tim8 = Timer(Timer.TIMER1, Timer.CHANNEL3, mode=Timer.MODE_PWM)
+
+PWM8 = PWM(tim8, freq=500000, duty=50, pin=13)
+def car_forward(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(0)
+    PWM2.duty(Motor_A)
+    PWM3.duty(0)
+    PWM4.duty(Motor_B)
+    PWM5.duty(0)
+    PWM6.duty(Motor_C)
+    PWM7.duty(0)
+    PWM8.duty(Motor_D)
+def car_backward(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(Motor_A)
+    PWM2.duty(0)
+    PWM3.duty(Motor_B)
+    PWM4.duty(0)
+    PWM5.duty(Motor_C)
+    PWM6.duty(0)
+    PWM7.duty(Motor_D)
+    PWM8.duty(0)
+def car_turn_left(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(Motor_A)
+    PWM2.duty(0)
+    PWM3.duty(0)
+    PWM4.duty(Motor_B)
+    PWM5.duty(Motor_C)
+    PWM6.duty(0)
+    PWM7.duty(0)
+    PWM8.duty(Motor_D)
+def car_turn_right(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(0)
+    PWM2.duty(Motor_A)
+    PWM3.duty(Motor_B)
+    PWM4.duty(0)
+    PWM5.duty(0)
+    PWM6.duty(Motor_C)
+    PWM7.duty(Motor_D)
+    PWM8.duty(0)
+def car_left(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(Motor_A)
+    PWM2.duty(0)
+    PWM3.duty(0)
+    PWM4.duty(Motor_B)
+    PWM5.duty(0)
+    PWM6.duty(Motor_C)
+    PWM7.duty(Motor_D)
+    PWM8.duty(0)
+def car_right(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(0)
+    PWM2.duty(Motor_A)
+    PWM3.duty(Motor_B)
+    PWM4.duty(0)
+    PWM5.duty(Motor_C)
+    PWM6.duty(0)
+    PWM7.duty(0)
+    PWM8.duty(Motor_D)
+
+last_angle_1 = 1
+last_angle_2 = 1
+last_angle_3 = 1
+last_angle_4 = 1
+Servo1_tim = Timer(Timer.TIMER2, Timer.CHANNEL0, mode=Timer.MODE_PWM)
+S1 = PWM(Servo1_tim, freq=50, duty=0, pin=12)
+Servo2_tim = Timer(Timer.TIMER2, Timer.CHANNEL1, mode=Timer.MODE_PWM)
+S2 = PWM(Servo2_tim, freq=50, duty=0, pin=11)
+Servo3_tim = Timer(Timer.TIMER2, Timer.CHANNEL2, mode=Timer.MODE_PWM)
+S3 = PWM(Servo3_tim, freq=50, duty=0, pin=10)
+Servo4_tim = Timer(Timer.TIMER2, Timer.CHANNEL3, mode=Timer.MODE_PWM)
+S4 = PWM(Servo4_tim, freq=50, duty=0, pin=3)
+def Servo_1(angle):
+    global last_angle_1
+    if last_angle_1 > angle:step = -1
+    else:step = 1
+    for i in range(last_angle_1,angle,step):
+        S1.duty((i+90)/180*10+2.5)
+        time.sleep(0.03)             #调节时间参数，改变缓动速度
+    last_angle_1 = angle
+def Servo_2(angle):
+    global last_angle_2
+    if last_angle_2 > angle:step = -1
+    else:step = 1
+    for i in range(last_angle_2,angle,step):
+        S2.duty((i+90)/180*10+2.5)
+        time.sleep(0.03)
+    last_angle_2 = angle
+def Servo_3(angle):
+    global last_angle_3
+    if last_angle_3 > angle:step = -1
+    else:step = 1
+    for i in range(last_angle_3,angle,step):
+        S3.duty((i+90)/180*10+2.5)
+        time.sleep(0.03)
+    last_angle_3 = angle
+def Servo_4(angle):
+    global last_angle_4
+    if last_angle_4 > angle:step = -1
+    else:step = 1
+    for i in range(last_angle_4,angle,step):
+        S4.duty((i+90)/180*10+2.5)
+        time.sleep(0.03)
+    last_angle_4 = angle
+#-------------------------------------------电机舵机设置------------------------------------------#
+
+
+#-------------------------------识别不同颜色的色块------------------------------------#
+def find_blob(color_threshold,roi_area):
+    img = sensor.snapshot()
+    blobs = img.find_blobs([color_threshold],roi=roi_area)  #roi为感兴趣区域，可以控制图像处理的区域
+    global b  #设为全局变量
+    if blobs:
+        for b in blobs:
+            if b[4] > 100:    #b[4]为像素点总数，这个判断用于去除一些不需要的干扰色块
+                tmp = img.draw_rectangle(b[0:4],color = (255, 255, 0))   #画框
+                tmp = img.draw_cross(b[5],b[6],color = (255, 255, 0))   #画像素中心点
+                print(b)
+                print(b[5])  #b[5]是色块中心点像素的x轴位置，可以用于巡线
+                #print(b[6])   #b[6]是色块中心点y轴位置，判断远近]
+    lcd.display(img)
+#-------------------------------识别不同颜色的色块------------------------------------#
+
+#------------------------------摄像头和液晶显示器初始化设定--------------------------------------#
+lcd.init()
+#lcd.rotation(3) #液晶屏翻转 1为90° 2为180° 3为270°
+sensor.reset()
+sensor.set_hmirror(1)      #摄像头水平镜像，0为关闭，1为开启
+sensor.set_vflip(1)        #摄像头垂直镜像，0为关闭，1为开启
+sensor.set_pixformat(sensor.RGB565)   #色彩
+sensor.set_framesize(sensor.QVGA)      #像素
+clock = time.clock()
+#------------------------------摄像头和液晶显示器初始化设定--------------------------------------#
+
+
+#启动后停车，舵机归位
+car_forward(0,0,0,0)
+Servo_1(0)
+Servo_2(0)
+Servo_3(0)
+Servo_4(0)
+
+##################此程序设置算法，根据跑道情况，进行修改。################
+#为了精确寻迹，可以将摄像头阻尼铰链向下(看得近)
+#为了提高巡线速度，可以将摄像头阻尼铰向上转(看得远)
+#1、修改black_threshold，用于适应环境灯光亮度。具体方法参考【视频教程2-颜色阈值确定方法】
+#2、k为调整转向灵敏度参数，转向越急，k调大，转向越灵敏。
+#3、track_line_area，巡黑线的视觉区域，尽可能显示在显示器中间。范围太大容易识别到远处的其他黑线，范围太小不能及时捕捉到转弯线。
+#【x轴左侧起点，y轴上面起点，x轴宽度区域，y轴高度区域】以x轴160，y轴120为中心。
+#4、p为整个寻迹速度，为了保证pwm>50，电机启动，p必须大于0.75，为了保证pwm<=100，p必须小于等于1
+black_threshold = (0, 39, -128, 127, -128, 127)
+k=80
+track_line_area = [60,80,200,80]
+p=1
+
+
+while True:
+    clock.tick()
+    find_blob(black_threshold,track_line_area)   #找到黑色色块，find_blob()函数会获得一个返回值b，b是一个数组，包含了色块的起始坐标、宽度、像素数量、像素中心坐标
+    d_speed = (160 - b[5])    ##b[5]是像素的中心位置，160是整个画面320*240像素的一半位置，建立一个变量d_speed用于记录与中心黑线的距离差
+    k_speed=d_speed*25/(160-k) #为了保证pwm不能超过100或小于0，故b_speed和k_speed需要建立关系。
+    if k_speed>25: k_speed=25
+    elif k_speed<-25 :k_speed=-25
+    car_forward(p*(75-k_speed),p*(75+k_speed),p*(75-k_speed),p*(75+k_speed))
+    #print("fps={}".format(clock.fps()))
+

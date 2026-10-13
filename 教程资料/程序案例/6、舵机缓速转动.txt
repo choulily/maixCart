@@ -1,0 +1,69 @@
+from machine import Timer, PWM
+import time
+
+#定义舵机缓慢转动需要的变量
+last_angle_1 = 1
+last_angle_2 = 1
+last_angle_3 = 1
+last_angle_4 = 1
+
+Servo1_tim = Timer(Timer.TIMER2, Timer.CHANNEL0, mode=Timer.MODE_PWM)
+S1 = PWM(Servo1_tim, freq=50, duty=0, pin=12)
+Servo2_tim = Timer(Timer.TIMER2, Timer.CHANNEL1, mode=Timer.MODE_PWM)
+S2 = PWM(Servo2_tim, freq=50, duty=0, pin=11)
+Servo3_tim = Timer(Timer.TIMER2, Timer.CHANNEL2, mode=Timer.MODE_PWM)
+S3 = PWM(Servo3_tim, freq=50, duty=0, pin=10)
+Servo4_tim = Timer(Timer.TIMER2, Timer.CHANNEL3, mode=Timer.MODE_PWM)
+S4 = PWM(Servo4_tim, freq=50, duty=0, pin=3)
+
+def Servo_1(angle):
+    global last_angle_1
+    if last_angle_1 > angle:step = -1
+    else:step = 1
+    for i in range(last_angle_1,angle,step):
+        S1.duty((i+90)/180*10+2.5)
+        time.sleep(0.05)             #调节时间参数，改变缓动速度
+    last_angle_1 = angle
+def Servo_2(angle):
+    global last_angle_2
+    if last_angle_2 > angle:step = -1
+    else:step = 1
+    for i in range(last_angle_2,angle,step):
+        S2.duty((i+90)/180*10+2.5)
+        time.sleep(0.05)
+    last_angle_2 = angle
+def Servo_3(angle):
+    global last_angle_3
+    if last_angle_3 > angle:step = -1
+    else:step = 1
+    for i in range(last_angle_3,angle,step):
+        S3.duty((i+90)/180*10+2.5)
+        time.sleep(0.05)
+    last_angle_3 = angle
+def Servo_4(angle):
+    global last_angle_4
+    if last_angle_4 > angle:step = -1
+    else:step = 1
+    for i in range(last_angle_4,angle,step):
+        S4.duty((i+90)/180*10+2.5)
+        time.sleep(0.05)
+    last_angle_4 = angle
+
+Servo_1(0)
+Servo_2(0)
+Servo_3(0)
+Servo_4(0)
+time.sleep(1)
+while True:
+    Servo_1(-45)
+    Servo_1(45)
+    Servo_1(0)
+    Servo_2(-35)
+    Servo_2(35)
+    Servo_2(0)
+    Servo_3(-35)
+    Servo_3(35)
+    Servo_3(0)
+    Servo_4(-45)
+    Servo_4(45)
+    Servo_4(0)

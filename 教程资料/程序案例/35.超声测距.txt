@@ -1,0 +1,34 @@
+import time
+from Maix import GPIO
+from fpioa_manager import fm
+
+#注册GPIO31和GPIO30为Trig和Echo信号
+fm.register(31,fm.fpioa.GPIO0)
+fm.register(30,fm.fpioa.GPIO1)
+trig=GPIO(GPIO.GPIO0,GPIO.OUT)
+echo=GPIO(GPIO.GPIO1,GPIO.IN)
+#申明测距函数
+def get_distance():
+    # 发送触发信号
+    trig.value(0)
+    time.sleep_us(2)
+    trig.value(1)
+    time.sleep_us(10)
+    trig.value(0)
+    # 等待回声信号
+    while echo.value() == 0:
+        pass
+    pulse_start = time.ticks_us()
+    while echo.value() == 1:
+        pass
+    pulse_end = time.ticks_us()
+    # 计算脉冲持续时间
+    pulse_duration = pulse_end - pulse_start
+    # 计算距离（单位：厘米）
+    distance = pulse_duration * 0.0343 / 2
+    return distance
+
+while True:
+    dist = get_distance()
+    print("Distance: {:.2f} cm".format(dist))
+    time.sleep(0.1)

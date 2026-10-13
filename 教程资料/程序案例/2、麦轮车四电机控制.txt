@@ -1,0 +1,92 @@
+#导入库文件 包括IO映射和PWM库
+from machine import Timer, PWM
+import time
+
+#定时器Timer0、Timer1、Timer2，每个有4个频道CHANNEL0-CHANNEL3
+#麦克纳姆轮机械臂小车，Timer0的四个频道控制2个电机，Timer1的四个频道控制2个电机，Timer2的四个频道控制四个舵机
+#pin21和pin22可控制Motor_A电机正反转和PWM调速
+tim1 = Timer(Timer.TIMER0, Timer.CHANNEL0, mode=Timer.MODE_PWM)
+PWM1 = PWM(tim1, freq=500000, duty=50, pin=21)
+tim2 = Timer(Timer.TIMER0, Timer.CHANNEL1, mode=Timer.MODE_PWM)
+PWM2 = PWM(tim2, freq=500000, duty=50, pin=22)
+#pin23和pin24可控制Motor_B电机
+tim3 = Timer(Timer.TIMER0, Timer.CHANNEL2, mode=Timer.MODE_PWM)
+PWM3 = PWM(tim3, freq=500000, duty=50, pin=23)
+tim4 = Timer(Timer.TIMER0, Timer.CHANNEL3, mode=Timer.MODE_PWM)
+PWM4 = PWM(tim4, freq=500000, duty=50, pin=24)
+#pin15和pin32可控制Motor_C电机
+tim5 = Timer(Timer.TIMER1, Timer.CHANNEL0, mode=Timer.MODE_PWM)
+PWM5 = PWM(tim5, freq=500000, duty=50, pin=15)
+tim6 = Timer(Timer.TIMER1, Timer.CHANNEL1, mode=Timer.MODE_PWM)
+PWM6 = PWM(tim6, freq=500000, duty=50, pin=32)
+#pin14和pin13可控制Motor_D电机
+tim7 = Timer(Timer.TIMER1, Timer.CHANNEL2, mode=Timer.MODE_PWM)
+PWM7 = PWM(tim7, freq=500000, duty=50, pin=14)
+tim8 = Timer(Timer.TIMER1, Timer.CHANNEL3, mode=Timer.MODE_PWM)
+PWM8 = PWM(tim8, freq=500000, duty=50, pin=13)
+#########电机扩展板通用UNO，UNO的D6 D7控制Motor_C,因为只有D6有pwm功能，故为了通用性，在Maxiduino中，Motor_C引脚为IO15和IO31###
+
+#############麦克纳姆轮小车运动控制函数###############
+def car_forward(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(0)
+    PWM2.duty(Motor_A)
+    PWM3.duty(0)
+    PWM4.duty(Motor_B)
+    PWM5.duty(0)
+    PWM6.duty(Motor_C)
+    PWM7.duty(0)
+    PWM8.duty(Motor_D)
+def car_backward(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(Motor_A)
+    PWM2.duty(0)
+    PWM3.duty(Motor_B)
+    PWM4.duty(0)
+    PWM5.duty(Motor_C)
+    PWM6.duty(0)
+    PWM7.duty(Motor_D)
+    PWM8.duty(0)   
+def car_turn_left(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(Motor_A)
+    PWM2.duty(0)
+    PWM3.duty(0)
+    PWM4.duty(Motor_B)
+    PWM5.duty(Motor_C)
+    PWM6.duty(0)
+    PWM7.duty(0)
+    PWM8.duty(Motor_D)   
+def car_turn_right(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(0)
+    PWM2.duty(Motor_A)
+    PWM3.duty(Motor_B)
+    PWM4.duty(0)
+    PWM5.duty(0)
+    PWM6.duty(Motor_C)
+    PWM7.duty(Motor_D)
+    PWM8.duty(0)
+def car_left(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(Motor_A)
+    PWM2.duty(0)
+    PWM3.duty(0)
+    PWM4.duty(Motor_B)
+    PWM5.duty(0)
+    PWM6.duty(Motor_C)
+    PWM7.duty(Motor_D)
+    PWM8.duty(0)
+def car_right(Motor_A,Motor_B,Motor_C,Motor_D):
+    PWM1.duty(0)
+    PWM2.duty(Motor_A)
+    PWM3.duty(Motor_B)
+    PWM4.duty(0)
+    PWM5.duty(Motor_C)
+    PWM6.duty(0)
+    PWM7.duty(0)
+    PWM8.duty(Motor_D)
+#############麦克纳姆轮小车运动控制函数###############
+
+
+car_forward(0,0,0,0)    #启动停3秒 
+time.sleep(3)
+while True:
+    car_forward(70,70,70,70)
+	
+

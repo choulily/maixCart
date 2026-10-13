@@ -1,0 +1,44 @@
+import sensor, image, time, lcd
+
+from maix import KPU
+import gc
+
+lcd.init()
+sensor.reset()                      # 重置并初始化摄像头
+                                    # 自动运行，调用sensor.run(0)停止
+sensor.set_hmirror(1)      #摄像头水平镜像，0为关闭，1为开启
+sensor.set_vflip(1)        #摄像头垂直镜像，0为关闭，1为开启
+sensor.set_pixformat(sensor.RGB565) # 设置像素格式为RGB565(或GRAYSCALE)
+sensor.set_framesize(sensor.QVGA)   # 设置帧大小为QVGA (320x240)
+sensor.skip_frames(time = 1000)     # 等待设置生效。
+clock = time.clock()                # 创建一个时钟对象来跟踪FPS。
+
+od_img = image.Image(size=(320,256)) # 设置图像尺寸
+
+anchor = (0.893, 1.463, 0.245, 0.389, 1.55, 2.58, 0.375, 0.594, 3.099, 5.038, 0.057, 0.090, 0.567, 0.904, 0.101, 0.160, 0.159, 0.255)
+kpu = KPU()
+#kpu.load_kmodel("/sd/yolo_face_detect.kmodel")  # 模型保存在SD卡中，从SD卡中直接加载模型
+kpu.load_kmodel(0x300000,278440)  # 我们需要把kmodel模型烧入到0x300000的位置，278440为模型的大小，我们可以通过查看文件属性可以得到；
+kpu.init_yolo2(anchor, anchor_num=9, img_w=320, img_h=240, net_w=320 , net_h=256 ,layer_w=10 ,layer_h=8, threshold=0.7, nms_value=0.3, classes=1)
+
+while True:
+    #print("mem free:",gc.mem_free())  # 查询剩余内存
+    clock.tick()                       # 更新 FPS 时钟
+    img = sensor.snapshot()
+    a = od_img.draw_image(img, 0,0)
+    od_img.pix_to_ai()
+    # 对摄像头采集到的图像传递到KPU单元进行yolo模型运算
+    kpu.run_with_output(od_img)
+    dect = kpu.regionlayer_yolo2()
+
+    fps = clock.fps()
+    if len(dect) > 0:      # 识别到人脸
+        print("dect:",dect)
+        for l in dect :    # 画矩形框，框起人脸
+            a = img.draw_rectangle(l[0],l[1],l[2],l[3], color=(0, 255, 0))
+
+    a = img.draw_string(0, 0, "%2.1ffps" %(fps), color=(0, 60, 128), scale=2.0) #在LCD上显示帧率
+    lcd.display(img)  # 在LCD显示屏上显示图像
+    gc.collect()      # 内存回收机制
+
+kpu.deinit()

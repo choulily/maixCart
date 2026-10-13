@@ -1,0 +1,33 @@
+import sensor, image, time , lcd
+
+area = [0,0,320,240]  #视觉区域，可自行设定区域范围，全屏为340*240
+
+#------------------------------摄像头和液晶显示器初始化设定--------------------------------------#
+lcd.init()
+#lcd.rotation(3) #液晶屏翻转 1为90° 2为180° 3为270°
+sensor.reset()
+sensor.set_hmirror(1)      #摄像头水平镜像，0为关闭，1为开启，不同店买的ov2640摄像头方向各不相同，本店购买，无需修改
+sensor.set_vflip(1)        #摄像头垂直镜像，0为关闭，1为开启
+sensor.set_pixformat(sensor.RGB565)   #色彩
+sensor.set_framesize(sensor.QVGA)      #像素
+clock = time.clock()
+#------------------------------摄像头和液晶显示器初始化设定--------------------------------------#
+
+#------------------------------识别圆形---------------------------------------------#
+def find_circle():
+    img = sensor.snapshot()
+    for c in img.find_circles(area,threshold=1000,x_margin=100,y_margin=100,r_margin=100,r_min=30,r_max=100,r_step=20):
+         #threshold为识别圆形的精度，越高越圆；x_margin等参数用于或复原识别时跳过的x像素量，增大此值，可以减少识别到的圆的数量；r_min为识别到的圆的最小半径
+        c = img.draw_circle([c.x(),c.y(),c.r()],(0,0,0),1,0)   #x、y、z坐标，(0,0,0)RGB颜色，粗细1，填充0
+    #print(c)
+    lcd.display(img) #液晶显示器注释可以加快运行效率
+#------------------------------识别圆形---------------------------------------------#
+
+while True:
+    clock.tick()
+    find_circle()
+    print("fps={}".format(clock.fps()))
+
+
+
+

@@ -1,0 +1,51 @@
+#https://wiki.sipeed.com/soft/maixpy/zh/course/image/find_color_blob.html
+#https://wiki.sipeed.com/soft/maixpy/zh/api_reference/machine_vision/image/image.html
+import sensor, image, time , lcd
+
+area = [0,0,320,240]  #视觉区域，可自行设定区域范围，全屏为340*240
+
+#------------------------------摄像头和液晶显示器初始化设定--------------------------------------#
+lcd.init()
+#lcd.rotation(3) #液晶屏翻转 1为90° 2为180° 3为270°
+sensor.reset()
+sensor.set_hmirror(1)      #摄像头水平镜像，0为关闭，1为开启，不同店买的ov2640摄像头方向各不相同，无需修改
+sensor.set_vflip(1)        #摄像头垂直镜像，0为关闭，1为开启
+sensor.set_pixformat(sensor.RGB565)   #色彩
+sensor.set_framesize(sensor.QVGA)      #像素
+clock = time.clock()
+#------------------------------摄像头和液晶显示器初始化设定--------------------------------------#
+
+#------------------------------识别不同颜色色块的参数，需要额外颜色自行添加--------------------------#
+#获取参数方法：在运行此程序时，打开'工具'-'机器视觉'-'阈值编辑器'，拖动滑动条，使需要的颜色为白色，不需要的颜色为黑色----#
+red_threshold = (0, 100, 22, 127, -27, 127)
+yellow_threshold = (93, 51, -128, 127, 26, 82)
+green_threshold = (15, 76, -128, -11, -128, 127)
+blue_threshold = (17, 68, -12, 31, -60, -13)
+pink_threshold = (54, 13, 22, 71, 49, 22)
+black_threshold = (0, 58, -128, 127, -128, 127)
+white_threshold = (100, 95, -128, 127, -128, 127)
+#------------------------------识别不同颜色色块的参数，基本不需要改变，需要额外颜色自行添加--------------------------#
+
+#-------------------------------识别不同颜色的色块------------------------------------#
+def find_blob(color_threshold,roi_area):
+    img = sensor.snapshot()
+    blobs = img.find_blobs([color_threshold],roi=roi_area)  #roi为感兴趣区域，可以控制图像处理的区域
+    if blobs:
+        for b in blobs:
+            if b[4] > 100:    #b[4]为像素点总数，这个判断用于去除一些不需要的干扰色块
+                tmp = img.draw_rectangle(b[0:4],color = (255, 255, 0))   #画框
+                tmp = img.draw_cross(b[5],b[6],color = (255, 255, 0))   #画像素中心点
+                print(b)
+                #print(b[5])  #b[5]是色块中心点像素的x轴位置，可以用于巡线
+                #print(b[6])   #b[6]是色块中心点y轴位置，判断远近]
+                lcd.display(img)  #去除液晶显示器可以加快运行效率
+                return b
+    lcd.display(img) #液晶显示器注释可以加快运行效率
+#-------------------------------识别不同颜色的色块------------------------------------#
+
+while True:
+    clock.tick()
+    find_blob(green_threshold,area)
+    print("fps={}".format(clock.fps()))
+
+

@@ -1,0 +1,33 @@
+import sensor, image, time , lcd
+
+area = [0,0,320,240]  #视觉区域，可自行设定区域范围，全屏为340*240
+
+#------------------------------摄像头和液晶显示器初始化设定--------------------------------------#
+lcd.init()
+#lcd.rotation(3) #液晶屏翻转 1为90° 2为180° 3为270°
+sensor.reset()
+sensor.set_hmirror(1)      #摄像头水平镜像，0为关闭，1为开启，不同店买的ov2640摄像头方向各不相同，本店购买，无需修改
+sensor.set_vflip(1)        #摄像头垂直镜像，0为关闭，1为开启
+sensor.set_pixformat(sensor.RGB565)   #色彩
+sensor.set_framesize(sensor.QVGA)      #像素
+clock = time.clock()
+#------------------------------摄像头和液晶显示器初始化设定--------------------------------------#
+
+#--------------------------------识别直线---------------------------------------------#
+def find_line():
+    img = sensor.snapshot()
+    for l in img.find_lines(threshold = 2000, theta_margin = 25, rho_margin = 25):
+           if (0 <= l.theta()) and (l.theta() <= 180):
+                img.draw_line(l.line(), color = (255, 0, 0))
+                print(l.theta())  #直线斜率
+    lcd.display(img)
+#--------------------------------识别直线---------------------------------------------#
+
+while True:
+    clock.tick()
+    find_line()
+    print("fps={}".format(clock.fps()))
+
+
+
+

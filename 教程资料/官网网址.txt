@@ -1,0 +1,3 @@
+https://wiki.sipeed.com/soft/maixpy/zh/get_started/upgrade_maixpy_firmware.html
+
+https://developer.canaan-creative.com/products#/document/canmv
