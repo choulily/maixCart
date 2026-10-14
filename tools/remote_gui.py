@@ -20,11 +20,19 @@ Keyboard (the window must have focus):
                                 6 rotate right, 7 release, 8 grab)
     P                           home pose (all servos to SERVO_HOME)
     + / -                       drive speed        [ / ]  servo step size
+
+Gamepad (wired through the OS, USB or Bluetooth - see the Gamepad class below):
+    left stick drive, right stick spin, A/B clamp, X home, Y stop,
+    Start E-STOP/resume, LB/RB little arm, D-pad big arm + rotation,
+    LT/RT speed.  Works even when the window is not focused.
 """
+import glob
 import json
 import os
 import queue
+import select
 import socket
+import struct
 import sys
 import threading
 import time
@@ -65,9 +73,176 @@ SERVO_KEYS = {
     "c": ("clamp", "grab"), "v": ("clamp", "release"),
 }
 STALE_TELEMETRY_S = 1.5          # after this long without telemetry: "silent"
-REPEAT_GAP_S = 0.15              # a key release + auto-repeat press gap is shorter than this
+DRIVE_TICK_MS = 60               # re-send the held input this often (the bot's
+                                 # watchdog needs a 'move' every 600 ms)
+REPEAT_GAP_S = 0.15              # a release + auto-repeat press gap is shorter than this
+RELEASE_GAP_S = 0.10             # ... and for a key that never auto-repeated
 MAX_KEY_HOLD_S = 10.0            # safety: forget a key that sent no events for this long
 KEY_CHAR_ALIASES = {" ": "space"}
+
+# ------------------------------------------------------------- gamepad ---
+# A gamepad connected to THIS laptop (USB or Bluetooth - the OS pairs/plugs it
+# in, the GUI just reads it) drives the cart through the same path as the
+# keyboard and the mouse pad.  The cart's ESP32 cannot host a controller: it
+# runs the WiFi/ADC firmware, and Bluetooth HID would need new firmware on it.
+# Linux exposes every gamepad as /dev/input/jsN; the 8-byte legacy joystick
+# events are read directly - no libraries, no daemon.
+# Numbers differ between pads: tick "log keys" and watch the "pad:" log lines
+# to see what each button/axis reports, then adjust the tables below.
+PAD_DEADZONE = 0.35              # stick travel that starts driving
+PAD_RELEASE = 0.22               # ... and that stops again (hysteresis)
+PAD_HAT = 16000                  # hat (D-pad) value that counts as pressed
+PAD_TRIGGER = 0.5                # trigger travel that counts as pressed
+PAD_REPEAT_S = 0.25              # held arm buttons / D-pad repeat this often
+PAD_AXIS_LX, PAD_AXIS_LY = 0, 1  # left stick
+PAD_AXIS_SPIN = 3                # right stick X (2 is used when 3 is missing)
+PAD_AXIS_RSPIN_FALLBACK = 2
+PAD_AXIS_LT, PAD_AXIS_RT = 2, 5  # analog triggers -> speed trim
+PAD_AXIS_HATX, PAD_AXIS_HATY = 6, 7
+PAD_BUTTONS = {                  # js button -> one-shot action on press
+    0: ("send", "grab"),         # A
+    1: ("send", "release"),      # B
+    2: ("send", "home"),         # X
+    3: ("stop",),                # Y: stop the wheels
+    7: ("estop",),               # Start: E-STOP / resume (like Esc)
+}
+PAD_HOLD = {                     # js button -> action repeated while held
+    4: ("nudge", "little_arm", +1),   # LB
+    5: ("nudge", "little_arm", -1),   # RB
+}
+# D-pad: up/down = big arm, left/right = arm rotation (hat axes)
+PAD_HAT_ACTIONS = {
+    (PAD_AXIS_HATX, -1): ("nudge", "rotation", +1),
+    (PAD_AXIS_HATX, +1): ("nudge", "rotation", -1),
+    (PAD_AXIS_HATY, -1): ("nudge", "big_arm", +1),
+    (PAD_AXIS_HATY, +1): ("nudge", "big_arm", -1),
+}
+
+
+class Gamepad:
+    """Read one /dev/input/jsN device in a background thread.
+
+    The reader thread only touches feed()/state(); the Tk thread only reads
+    snapshots and drains edge events, so no Tk call can come from the thread.
+    """
+
+    EV_BUTTON, EV_AXIS, EV_INIT = 1, 2, 0x80
+    EV_FMT = "<IhBB"             # time, value, type, number (struct js_event)
+
+    def __init__(self, path="auto"):
+        self.want = path or "auto"
+        self.path = None
+        self.name = None
+        self.note = "searching ..."
+        self.events = queue.Queue()          # edge events for the Tk thread
+        self._axes, self._buttons = {}, {}
+        self._last_ev = {}
+        self._buf = b""
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    # ---- Tk thread -------------------------------------------------------
+    def state(self):
+        """(axes, buttons) snapshot; js values are raw ints (±32767)."""
+        with self._lock:
+            return dict(self._axes), dict(self._buttons)
+
+    def close(self):
+        self._stop.set()
+
+    # ---- reader thread (and the tests) -----------------------------------
+    def feed(self, ev_type, number, value):
+        """Apply one js event (updates the state, pushes the edge event)."""
+        init = bool(ev_type & self.EV_INIT)
+        ev_type &= ~self.EV_INIT
+        with self._lock:
+            if ev_type == self.EV_BUTTON:
+                self._buttons[number] = value
+            elif ev_type == self.EV_AXIS:
+                self._axes[number] = value
+        if init:
+            return                            # "state so far" burst on open
+        if ev_type == self.EV_BUTTON:
+            self.events.put(("button", number, value))
+        elif ev_type == self.EV_AXIS:
+            last = self._last_ev.get(number, 0)
+            if abs(value - last) > 2000:      # log/drive only significant moves
+                self._last_ev[number] = value
+                self.events.put(("axis", number, value))
+
+    def consume(self, data):
+        """Parse raw js_event bytes (used by the reader loop and tests)."""
+        buf = self._buf + data
+        while len(buf) >= 8:
+            chunk, buf = buf[:8], buf[8:]
+            _, value, ev_type, number = struct.unpack(self.EV_FMT, chunk)
+            self.feed(ev_type, number, value)
+        self._buf = buf
+
+    # ---- device handling -------------------------------------------------
+    def _candidates(self):
+        if self.want != "auto":
+            return [self.want]
+        return sorted(glob.glob("/dev/input/js*"))
+
+    def _name_of(self, path):
+        try:
+            with open("/sys/class/input/%s/device/name" % os.path.basename(path)) as f:
+                return f.read().strip()
+        except Exception:
+            return None
+
+    def _run(self):
+        while not self._stop.is_set():
+            used = False
+            for path in self._candidates():
+                if self._stop.is_set():
+                    break
+                if self._read_loop(path):
+                    used = True
+                    break
+            if not used:
+                self.note = "none found (connect a USB / Bluetooth gamepad)"
+                self._stop.wait(2.0)          # rescan: BT pads appear later too
+
+    def _read_loop(self, path):
+        """Read one device until it goes away. True when it was a gamepad."""
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as e:
+            self.note = "cannot open %s (%s)" % (path, e.strerror or e)
+            return False
+        self._buf = b""
+        name = self._name_of(path) or path
+        self.path, self.name, self.note = path, name, name
+        seen, t0 = 0, time.time()
+        try:
+            while not self._stop.is_set():
+                try:
+                    ready, _, _ = select.select([fd], [], [], 0.5)
+                except OSError:
+                    break
+                if ready:
+                    try:
+                        data = os.read(fd, 8 * 64)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    self.consume(data)
+                    seen += 1
+                elif seen == 0 and time.time() - t0 > 1.5:
+                    break                     # opens but stays silent: not a pad
+                elif not os.path.exists(path):
+                    break                     # unplugged while select() was waiting
+        finally:
+            os.close(fd)
+        self.path = self.name = None
+        if seen == 0:
+            self.note = "%s: no events (not a gamepad?)" % name
+            return False
+        return True
 
 
 def key_name(event):
@@ -258,6 +433,8 @@ class App:
         self._dir_held = {}
         self._key_press = {}
         self._key_release = {}
+        self._key_first = {}                 # first press of the current hold
+        self._key_repeat = set()             # movement keys that auto-repeated
         self._pad_down = set()
         self._pad_time = {}
         self._wheel = None
@@ -273,6 +450,10 @@ class App:
         self._last_servo_key = {}
         self._wifi_ok = False
         self.log_keys = tk.BooleanVar(value=bool(cfg.get("log_keys", False)))
+        self.pad_deadzone = float(cfg.get("pad_deadzone", PAD_DEADZONE))
+        self.pad = Gamepad(str(cfg.get("pad", "auto")))
+        self._stick_time = {}                # pad axis -> (code, engaged time)
+        self._pad_repeat = {}                # held pad action -> last run time
 
         root.title("Maixduino cart remote control")
         root.minsize(880, 620)
@@ -496,8 +677,13 @@ class App:
         help_txt = ("W/S fwd/back   A/D strafe   Q/E spin   Space stop   Esc e-stop   "
                     "R/F big arm   T/G little arm   Y/H rotate   C/V grab/release   "
                     "1-8 as above   P home   +/- speed   [ ] step   |   mouse: use the "
-                    "drive pad / +/- buttons (keys need the window focused, click it once)")
-        tk.Label(root, text=help_txt, anchor="w", fg="#333333").pack(fill="x", padx=8, pady=(0, 6))
+                    "drive pad / +/- buttons (keys need the window focused, click it once)"
+                    "\ngamepad (USB or Bluetooth): L-stick drive   R-stick spin   "
+                    "A/B clamp grab/release   X home   Y stop   Start e-stop/resume   "
+                    "LB/RB little arm   D-pad big arm + rotation   LT/RT speed   "
+                    "(works even when the window is not focused)")
+        tk.Label(root, text=help_txt, anchor="w", justify="left", fg="#333333").pack(
+            fill="x", padx=8, pady=(0, 6))
 
     # ------------------------------------------------------------- log ----
     def log(self, text, tag="info"):
@@ -645,7 +831,13 @@ class App:
         if self._typing():
             return
         if k in MOVE_KEYS:
-            self._key_press[k] = time.time()
+            now = time.time()
+            if k in self._key_press:             # auto-repeat press (same key down)
+                self._key_repeat.add(k)
+            else:
+                self._key_first[k] = now         # newest input wins by this time
+            self._key_press[k] = now
+            self._apply_input()                  # react now, not on the next tick
         elif k in SERVO_KEYS:
             now = time.time()
             if now - self._last_servo_key.get(k, 0) < 0.15:   # ignore key auto-repeat
@@ -694,6 +886,8 @@ class App:
         if had:
             self._key_press.clear()
             self._key_release.clear()
+            self._key_first.clear()
+            self._key_repeat.clear()
             self._pad_down.clear()
             self._pad_time.clear()
             if self._wheel is not None:
@@ -706,7 +900,8 @@ class App:
         """Pressed-and-not-released, tolerant of the auto-repeat pattern.
 
         Both X11 and Wayland repeat a held key by sending release+press pairs, so
-        a release is only trusted when no new press follows within REPEAT_GAP_S.
+        a release is only trusted when no new press follows within a few
+        milliseconds; a key that never auto-repeated stops after RELEASE_GAP_S.
         """
         p = self._key_press.get(k, 0.0)
         r = self._key_release.get(k, 0.0)
@@ -714,7 +909,8 @@ class App:
             return False
         if p > r:
             return True
-        return (now - r) < REPEAT_GAP_S
+        gap = REPEAT_GAP_S if k in self._key_repeat else RELEASE_GAP_S
+        return (now - r) < gap
 
     def _pad_press(self, code):
         if self.log_keys.get():
@@ -724,12 +920,14 @@ class App:
             return
         self._pad_down.add(code)
         self._pad_time[code] = time.time()
+        self._apply_input()                  # react now, not on the next tick
 
     def _wheel_press(self, name, up):
         """Press and hold one wheel <-> its forward/reverse direction."""
         self._wheel = (name, up, time.time())
         self.log("-> motor %s %s @ %d" % (name, "forward" if up else "reverse",
                                           int(float(self.speed.get()))))
+        self._apply_input()                  # react now, not on the next tick
 
     def _wheel_release(self, name):
         if self._wheel and self._wheel[0] == name:
@@ -744,6 +942,8 @@ class App:
     def _stop_all(self):
         self._key_press.clear()
         self._key_release.clear()
+        self._key_first.clear()
+        self._key_repeat.clear()
         self._pad_down.clear()
         self._pad_time.clear()
         self._moving = False
@@ -753,33 +953,142 @@ class App:
         self._send("stop")
 
     def _held_directions(self, now):
-        """[(time, code)] for every held movement key / pressed pad button."""
+        """[(time, code)] for every held movement key / pad button / stick.
+
+        The timestamp is when the input first engaged, so the newest input
+        wins - deterministic even while several keys auto-repeat.
+        """
         out = []
         for k in list(self._key_press):
             code = MOVE_KEYS.get(k)
             if code and self._key_is_down(k, now):
-                out.append((self._key_press[k], code))
+                out.append((self._key_first.get(k, self._key_press[k]), code))
             elif code:
                 del self._key_press[k]
                 self._key_release.pop(k, None)
+                self._key_first.pop(k, None)
+                self._key_repeat.discard(k)
         for code in list(self._pad_down):
             out.append((self._pad_time.get(code, 0.0), code))
+        for code, t in self._stick_codes(now).items():
+            out.append((t, code))
         return out
 
-    def _drive_tick(self):
-        """Send 'move' repeatedly while a direction key/button is held."""
+    # -------------------------------------------------- gamepad mapping ---
+    @staticmethod
+    def _axis_on(value):
+        """Trigger pushed past the threshold.
+
+        joydev scales every axis to -32767..32767, so an axis declared 0..max
+        (the usual analog trigger) rests at -32767 and reads +32767 when fully
+        pulled - only the positive direction counts.
+        """
+        return value > PAD_TRIGGER * 32767
+
+    def _stick_dir(self, axis, neg_code, pos_code, now):
+        """Engaged code for one stick axis, with hysteresis and engage time."""
+        axes, _ = self.pad.state()
+        v = axes.get(axis, 0) / 32767.0
+        code = neg_code if v < 0 else pos_code
+        prev = self._stick_time.get(axis)
+        if prev and prev[0] == code and abs(v) > PAD_RELEASE:
+            return code, prev[1]                     # keep driving
+        if abs(v) >= self.pad_deadzone:
+            self._stick_time[axis] = (code, now)
+            return code, now
+        self._stick_time.pop(axis, None)
+        return None, 0.0
+
+    def _stick_codes(self, now):
+        """{movement code: engaged time} asked for by the gamepad sticks."""
+        axes, _ = self.pad.state()
+        if not axes:
+            return {}
+        if PAD_AXIS_SPIN in axes:
+            spin_axis = PAD_AXIS_SPIN
+        elif PAD_AXIS_RSPIN_FALLBACK in axes:
+            spin_axis = PAD_AXIS_RSPIN_FALLBACK
+        else:
+            spin_axis = None
+        code = t = None
+        if spin_axis is not None:
+            code, t = self._stick_dir(spin_axis, "tl", "tr", now)
+        if code is None and PAD_AXIS_LX in axes and PAD_AXIS_LY in axes:
+            lx, ly = axes.get(PAD_AXIS_LX, 0), axes.get(PAD_AXIS_LY, 0)
+            if abs(ly) >= abs(lx):                   # dominant axis drives
+                code, t = self._stick_dir(PAD_AXIS_LY, "f", "b", now)
+            else:
+                code, t = self._stick_dir(PAD_AXIS_LX, "l", "r", now)
+        return {code: t} if code else {}
+
+    def _pad_arm_tick(self, now):
+        """Held pad buttons / D-pad repeat the arm nudge every PAD_REPEAT_S."""
+        axes, buttons = self.pad.state()
+        actions = []
+        for num, action in PAD_HOLD.items():
+            if buttons.get(num):
+                actions.append((("btn", num), action))
+        for number in (PAD_AXIS_HATX, PAD_AXIS_HATY):
+            v = axes.get(number, 0)
+            if v <= -PAD_HAT:
+                actions.append((("hat", number, -1), PAD_HAT_ACTIONS[(number, -1)]))
+            elif v >= PAD_HAT:
+                actions.append((("hat", number, +1), PAD_HAT_ACTIONS[(number, +1)]))
+        for key, action in actions:
+            if now - self._pad_repeat.get(key, 0.0) > PAD_REPEAT_S:
+                self._pad_repeat[key] = now
+                self._run_pad_action(action)
+
+    def _pad_speed_trim(self, now):
+        """Triggers trim the speed slider while held (LT down, RT up)."""
+        axes, _ = self.pad.state()
+        for key, axis, delta in (("spd-", PAD_AXIS_LT, -5), ("spd+", PAD_AXIS_RT, +5)):
+            if self._axis_on(axes.get(axis, 0)) and now - self._pad_repeat.get(key, 0.0) > PAD_REPEAT_S:
+                self._pad_repeat[key] = now
+                self._set_speed(max(0, min(100, int(float(self.speed.get())) + delta)))
+
+    def _run_pad_action(self, action):
+        what, args = action[0], action[1:]
+        if what == "nudge":
+            self._nudge(args[0], args[1])
+        elif what == "send":
+            self._send(args[0])
+        elif what == "stop":
+            self._stop_all()
+        elif what == "estop":
+            self._toggle_estop()
+
+    def _pad_event(self, kind, number, value):
+        """One gamepad edge event, run in the Tk thread."""
+        if self.log_keys.get():
+            self.log("pad: %s %d -> %s" % (kind, number, value))
+        if kind == "button" and value:
+            action = PAD_BUTTONS.get(number)
+            if action:
+                self._run_pad_action(action)
+
+    def _set_speed(self, value):
+        self.speed.set(value)
+        self._speed_changed()
+
+    # --------------------------------------------------------- drive tick ---
+    def _apply_input(self):
+        """Send the movement the current input state (keys, pad, wheel test)
+        asks for.  Runs every DRIVE_TICK_MS and again right after a press, so
+        the cart reacts immediately instead of waiting for the next tick.
+        """
         now = time.time()
+        self._pad_speed_trim(now)
+        self._pad_arm_tick(now)
         held = self._held_directions(now)
         if not self.link.connected or self.estop_latched:
             self._moving = False
-            self.root.after(120, self._drive_tick)
             return
         if self._wheel is not None:
             name, up, _ = self._wheel
             self.link.send("motor %s %s %d" % (name, "f" if up else "r",
                                                int(float(self.speed.get()))))
             self._moving = True
-            self.root.after(120, self._drive_tick)
             return
         if held:
             _, code = max(held, key=lambda item: item[0])
@@ -800,7 +1109,11 @@ class App:
         elif self._moving:
             self._send("stop")
             self._moving = False
-        self.root.after(120, self._drive_tick)
+
+    def _drive_tick(self):
+        """Keep the input->cart path alive while a key/button is held."""
+        self._apply_input()
+        self.root.after(DRIVE_TICK_MS, self._drive_tick)
 
     # ----------------------------------------------------------- events ---
     def _pump(self):
@@ -821,6 +1134,11 @@ class App:
                 elif kind == "upload_done":
                     self._uploading = False
                     self.upload_btn.state(["!disabled"])
+        except queue.Empty:
+            pass
+        try:
+            while True:                          # gamepad edge events
+                self._pad_event(*self.pad.events.get_nowait())
         except queue.Empty:
             pass
         self.root.after(50, self._pump)
@@ -943,9 +1261,10 @@ class App:
         if now - self._last_tel < STALE_TELEMETRY_S:
             up = "  estop LATCHED" if self.estop_latched else ""
         self.status.configure(text=state + rtt + up, fg="#b00020" if self.estop_latched else color)
-        note = "listening on %s   |   bot wifi: %s" % (
+        note = "listening on %s   |   bot wifi: %s   |   pad: %s" % (
             self._listen_text() if self.link.listening else "-",
-            "ok" if (now - self._last_tel < STALE_TELEMETRY_S and self._wifi_ok) else "?")
+            "ok" if (now - self._last_tel < STALE_TELEMETRY_S and self._wifi_ok) else "?",
+            self.pad.note)
         if self._typing():
             note += "   |   KEYBOARD -> text field (click the background to drive again)"
         self.substatus.configure(text=note)
@@ -972,12 +1291,14 @@ class App:
             "speed": int(float(self.speed.get())), "step": float(self.step.get()),
             "brake": bool(self.brake_on.get()), "brake_cm": int(self.brake_cm.get()),
             "thr": self.thr_var.get(), "log_keys": bool(self.log_keys.get()),
+            "pad": self.pad.want, "pad_deadzone": self.pad_deadzone,
         }
         try:
             with open(SETTINGS, "w") as f:
                 json.dump(cfg, f, indent=1)
         except Exception:
             pass
+        self.pad.close()
         self.link.shutdown()
         self.root.destroy()
 

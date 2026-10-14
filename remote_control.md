@@ -71,6 +71,70 @@ the mouse too - so the cart can be driven without any keyboard input.
 **Auto-brake** (on by default): while driving *forward*, the GUI stops sending
 motion if the ultrasonic distance is below the threshold (15 cm default).
 
+Response time: a press is sent to the cart **immediately** (no tick wait), the
+input is re-sent every 60 ms while held (the bot's watchdog needs one every
+600 ms), and a release stops the wheels within ~100 ms.  The wheels themselves
+ramp up/down softly (`MOTOR_RAMP_DUTY_PER_TICK` in `remote_bot.py`, default 6
+duty units per 20 ms loop tick ≈ 180 ms from 0 to 55): raise it (e.g. 12) if
+the cart feels sluggish to start, but watch the shared 5 V rail - the servos
+and the ESP32 brown out if the motors draw current too abruptly.
+
+## Gamepad / 手柄 (USB or Bluetooth)
+
+A game controller connected to **this laptop** works as an input method next to
+the keyboard and the mouse pad.  Pair/plug it with the desktop first (Bluetooth
+settings, or just the USB cable); the GUI picks up the Linux joystick device
+(`/dev/input/js*`) on its own - no extra software, no configuration.  The third
+status line shows `pad: <name>` (or `pad: none found ...`).
+
+| Controller | Action |
+|------------|--------|
+| left stick | drive: forward/backward + strafe (the dominant axis wins) |
+| right stick X | spin left / right |
+| `A` / `B` | clamp grab / release |
+| `X` | home pose (`SERVO_HOME`) |
+| `Y` | stop the wheels (like `Space`) |
+| `Start` | **E-STOP** / resume (like `Esc`) |
+| `LB` / `RB` | little arm up / down (repeats while held) |
+| D-pad ↑/↓ | big arm up / down (repeats while held) |
+| D-pad ←/→ | arm rotation left / right (repeats while held) |
+| `LT` / `RT` | drive speed − / + (repeats while held) |
+
+The sticks drive the cart exactly like a held key (same watchdog, same
+auto-brake), so releasing a stick stops the wheels.  Unlike the keyboard the
+controller **keeps working while the window is not focused** - convenient when
+you watch the cart instead of the screen - so only use a controller you can
+reach quickly, and remember `Start` = E-STOP.
+
+Controller numbers differ between models: tick **log keys** and watch the
+`pad: button/axis N -> value` lines, then adjust `PAD_BUTTONS`, `PAD_HOLD`,
+`PAD_AXIS_*` and `PAD_HAT_ACTIONS` at the top of `tools/remote_gui.py` (and
+`PAD_DEADZONE` / `PAD_RELEASE` for the sticks).  Settings can also be put in
+`tools/.remote_gui.json` (`"pad": "/dev/input/js0"` to pin a device,
+`"pad_deadzone": 0.35`).
+
+Notes / 注意:
+
+* An **Xbox-style layout** (Mad Catz, 8BitDo, DualShock/DualSense, Google
+  Stadia, ...) works out of the box; the Stadia pairs with `Stadia + Y` held
+  until the light blinks (Bluetooth) or just works over USB-C.  Over Bluetooth
+  some pads report the triggers as digital buttons - the log shows what yours
+  sends.
+* No `pad:` line at all?  Check `ls /dev/input/js*` (plug in first) and that
+  the device is readable (`crw-rw-r-- root input`).  No `js*` file means the
+  `joydev` kernel module is missing.
+* The controller **cannot** be connected to the cart's ESP32: that module runs
+  the WiFi + tracker-ADC firmware over an SPI link to the K210, so it cannot
+  act as a Bluetooth HID host.  A controller on the *laptop* (this feature) or
+  a second BT-capable microcontroller wired to the K210 would be needed; the
+  laptop route is what this GUI does - it works over WiFi wherever the cart is
+  in range.
+
+The GUI's input logic can be re-checked without any hardware:
+`python3 tools/test_gui_logic.py` (keys / mouse pad / focus / wheel buttons) and
+`python3 tools/test_gui_pad.py` (latency + a virtual gamepad created through
+`/dev/uinput`).  Both need a display and no cart.
+
 ## Safety / 安全
 
 * **Watchdog in the bot**: if no `move` command arrives for 600 ms the motors
@@ -98,7 +162,7 @@ One command per line, from the GUI to the bot:
 
 | Command | Meaning |
 |---------|---------|
-| `move <f\|b\|l\|r\|tl\|tr> [speed]` | drive; must be repeated at least every 600 ms (the GUI sends it every 120 ms while a key is held) |
+| `move <f\|b\|l\|r\|tl\|tr> [speed]` | drive; must be repeated at least every 600 ms (the GUI re-sends it every 60 ms while an input is held) |
 | `stop` | stop the wheels |
 | `srv <name> <deg>` | servo to an absolute angle (`big_arm`, `little_arm`, `rotation`, `clamp`, 1…4) |
 | `nudge <name> <delta>` | move a servo by a relative angle |
@@ -216,5 +280,10 @@ restore a clean filesystem — the bot works fine without that.
   Channel `c4` is not wired on this tracker (reads 0) and is displayed anyway.
 * **A servo does nothing** — wrong pin in `SERVO_PINS`.  Use `ide/servo_hold_ide.py`
   or `servo_test.py` to find which pin moves which joint, then update the map.
+* **The controller does nothing** — check the third status line and
+  `ls -l /dev/input/js*`.  Nothing there: the pad is not connected/pair
+  finished yet, or the `joydev` module is missing.  A pad that *is* listed but
+  ignored (or does the wrong thing) is a different button/axis numbering: tick
+  **log keys** and remap `PAD_*` in `tools/remote_gui.py`.
 * **The cart does not move but telemetry works** — `estop` is latched (red status
   line) or the speed is 0.
