@@ -26,6 +26,8 @@ Gamepad (wired through the OS, USB or Bluetooth - see the Gamepad class below):
     Start E-STOP/resume, LB/RB little arm, D-pad big arm + rotation,
     LT/RT speed.  Works even when the window is not focused.
 """
+import errno
+import fcntl
 import glob
 import json
 import os
@@ -62,6 +64,13 @@ MOVE_KEYS = {"w": "f", "up": "f", "s": "b", "down": "b",
              "q": "tl", "e": "tr"}
 MOVE_LABEL = {"f": "forward", "b": "backward", "l": "strafe left", "r": "strafe right",
               "tl": "spin left", "tr": "spin right"}
+# movement code -> (forward, strafe-right, spin-right) at full deflection.
+# Held inputs add up (W+A = forward-left diagonal, W+Q = left curve while
+# driving); the bot turns the blend into per-wheel duty differentials
+# ('mix' command in remote_bot.py).
+MOVE_VECTORS = {"f": (100, 0, 0), "b": (-100, 0, 0),
+                "l": (0, -100, 0), "r": (0, 100, 0),
+                "tl": (0, 0, -100), "tr": (0, 0, 100)}
 SERVO_KEYS = {
     "r": ("big_arm", +1), "f": ("big_arm", -1),
     "t": ("little_arm", +1), "g": ("little_arm", -1),
@@ -81,62 +90,90 @@ MAX_KEY_HOLD_S = 10.0            # safety: forget a key that sent no events for 
 KEY_CHAR_ALIASES = {" ": "space"}
 
 # ------------------------------------------------------------- gamepad ---
-# A gamepad connected to THIS laptop (USB or Bluetooth - the OS pairs/plugs it
-# in, the GUI just reads it) drives the cart through the same path as the
+# A gamepad connected to THIS laptop (USB or Bluetooth - the OS pairs or plugs
+# it in, the GUI just reads it) drives the cart through the same path as the
 # keyboard and the mouse pad.  The cart's ESP32 cannot host a controller: it
 # runs the WiFi/ADC firmware, and Bluetooth HID would need new firmware on it.
-# Linux exposes every gamepad as /dev/input/jsN; the 8-byte legacy joystick
-# events are read directly - no libraries, no daemon.
-# Numbers differ between pads: tick "log keys" and watch the "pad:" log lines
-# to see what each button/axis reports, then adjust the tables below.
-PAD_DEADZONE = 0.35              # stick travel that starts driving
+#
+# The reader uses the *evdev* interface (/dev/input/eventN), where every pad
+# reports standard codes (BTN_SOUTH, ABS_X, ABS_HAT0Y, ...) *and* each axis'
+# range - so the same mapping works for Xbox/DualShock/Stadia/8BitDo pads.
+# (The legacy /dev/input/jsN numbering differs per pad/driver and hides the
+# ranges: that is what made an earlier version misread a Stadia controller.)
+# Tick "log keys" to see the codes a pad sends; remap with the tables below.
+PAD_DEADZONE = 0.35              # stick travel that starts moving
 PAD_RELEASE = 0.22               # ... and that stops again (hysteresis)
-PAD_HAT = 16000                  # hat (D-pad) value that counts as pressed
+PAD_HAT = 0.5                    # hat (D-pad) deflection that counts as pressed
 PAD_TRIGGER = 0.5                # trigger travel that counts as pressed
 PAD_REPEAT_S = 0.25              # held arm buttons / D-pad repeat this often
-PAD_AXIS_LX, PAD_AXIS_LY = 0, 1  # left stick
-PAD_AXIS_SPIN = 3                # right stick X (2 is used when 3 is missing)
-PAD_AXIS_RSPIN_FALLBACK = 2
-PAD_AXIS_LT, PAD_AXIS_RT = 2, 5  # analog triggers -> speed trim
-PAD_AXIS_HATX, PAD_AXIS_HATY = 6, 7
-PAD_BUTTONS = {                  # js button -> one-shot action on press
-    0: ("send", "grab"),         # A
-    1: ("send", "release"),      # B
-    2: ("send", "home"),         # X
-    3: ("stop",),                # Y: stop the wheels
-    7: ("estop",),               # Start: E-STOP / resume (like Esc)
+
+PAD_EV_KEY, PAD_EV_ABS = 1, 3
+PAD_ABS_X, PAD_ABS_Y = 0x00, 0x01          # left stick (X, Y)
+PAD_ABS_Z, PAD_ABS_RZ = 0x02, 0x05         # right stick X / Y on some pads
+PAD_ABS_RX = 0x03                          # right stick X on most pads
+PAD_ABS_GAS, PAD_ABS_BRAKE = 0x09, 0x0a    # RT / LT (Stadia & friends)
+PAD_ABS_HAT0X, PAD_ABS_HAT0Y = 0x10, 0x11  # D-pad
+PAD_AXIS_NAMES = {PAD_ABS_X: "ABS_X", PAD_ABS_Y: "ABS_Y", PAD_ABS_Z: "ABS_Z",
+                  PAD_ABS_RX: "ABS_RX", 0x04: "ABS_RY", PAD_ABS_RZ: "ABS_RZ",
+                  PAD_ABS_GAS: "ABS_GAS(RT)", PAD_ABS_BRAKE: "ABS_BRAKE(LT)",
+                  PAD_ABS_HAT0X: "ABS_HAT0X", PAD_ABS_HAT0Y: "ABS_HAT0Y"}
+PAD_BTN_NAMES = {0x130: "BTN_SOUTH(A)", 0x131: "BTN_EAST(B)", 0x133: "BTN_NORTH(X)",
+                 0x134: "BTN_WEST(Y)", 0x136: "BTN_TL(LB)", 0x137: "BTN_TR(RB)",
+                 0x13a: "BTN_SELECT", 0x13b: "BTN_START", 0x13c: "BTN_MODE",
+                 0x13d: "BTN_THUMBL", 0x13e: "BTN_THUMBR"}
+PAD_BUTTONS = {                  # evdev button -> one-shot action on press
+    0x130: ("send", "grab"),     # A
+    0x131: ("send", "release"),  # B
+    0x133: ("send", "home"),     # X
+    0x134: ("stop",),            # Y: stop the wheels
+    0x13b: ("estop",),           # Start: E-STOP / resume (like Esc)
 }
-PAD_HOLD = {                     # js button -> action repeated while held
-    4: ("nudge", "little_arm", +1),   # LB
-    5: ("nudge", "little_arm", -1),   # RB
+PAD_HOLD = {                     # evdev button -> action repeated while held
+    0x136: ("nudge", "little_arm", +1),   # LB
+    0x137: ("nudge", "little_arm", -1),   # RB
 }
 # D-pad: up/down = big arm, left/right = arm rotation (hat axes)
 PAD_HAT_ACTIONS = {
-    (PAD_AXIS_HATX, -1): ("nudge", "rotation", +1),
-    (PAD_AXIS_HATX, +1): ("nudge", "rotation", -1),
-    (PAD_AXIS_HATY, -1): ("nudge", "big_arm", +1),
-    (PAD_AXIS_HATY, +1): ("nudge", "big_arm", -1),
+    (PAD_ABS_HAT0X, -1): ("nudge", "rotation", +1),
+    (PAD_ABS_HAT0X, +1): ("nudge", "rotation", -1),
+    (PAD_ABS_HAT0Y, -1): ("nudge", "big_arm", +1),
+    (PAD_ABS_HAT0Y, +1): ("nudge", "big_arm", -1),
 }
+# What "pad_spin" can be set to in the settings JSON if a pad's right stick is
+# not the Z axis assumed below (one line in .remote_gui.json).
+PAD_SPIN_CHOICES = {"ABS_Z": PAD_ABS_Z, "ABS_RZ": PAD_ABS_RZ, "ABS_RX": PAD_ABS_RX}
+
+
+def _ev_ioc_read(nr, size):
+    """_IOC(_IOC_READ, 'E', nr, size) - evdev's ioctl numbers."""
+    return (2 << 30) | (size << 16) | (0x45 << 8) | nr
+
+
+def _ev_bits(fd, ev_type, size):
+    """Set of event codes of one type that the device declares."""
+    buf = fcntl.ioctl(fd, _ev_ioc_read(0x20 + ev_type, size), b"\0" * size)
+    return {i * 8 + j for i, b in enumerate(buf) for j in range(8) if b & (1 << j)}
 
 
 class Gamepad:
-    """Read one /dev/input/jsN device in a background thread.
+    """Read one gamepad event device (/dev/input/eventN) in a background thread.
 
     The reader thread only touches feed()/state(); the Tk thread only reads
     snapshots and drains edge events, so no Tk call can come from the thread.
     """
 
-    EV_BUTTON, EV_AXIS, EV_INIT = 1, 2, 0x80
-    EV_FMT = "<IhBB"             # time, value, type, number (struct js_event)
+    EV_FMT = "<qqHHi"                    # struct input_event (64-bit timeval)
 
-    def __init__(self, path="auto"):
+    def __init__(self, path="auto", spin_axis=None):
         self.want = path or "auto"
+        self.spin_axis = spin_axis       # optional ABS_* override for the spin axis
         self.path = None
         self.name = None
         self.note = "searching ..."
-        self.events = queue.Queue()          # edge events for the Tk thread
-        self._axes, self._buttons = {}, {}
-        self._last_ev = {}
+        self.layout = None               # {"lx","ly","spin","lt","rt"} axis codes
+        self.events = queue.Queue()      # ("button"|"axis"|"device", code, value)
+        self._axes, self._buttons, self._range = {}, {}, {}
+        self._last_frac = {}
         self._buf = b""
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -144,54 +181,136 @@ class Gamepad:
 
     # ---- Tk thread -------------------------------------------------------
     def state(self):
-        """(axes, buttons) snapshot; js values are raw ints (±32767)."""
+        """(axes, buttons) snapshot with the raw evdev values."""
         with self._lock:
             return dict(self._axes), dict(self._buttons)
+
+    def stick(self, code):
+        """Axis as -1..1 around its centre, or None when there is no axis."""
+        if code is None:
+            return None
+        with self._lock:
+            value = self._axes.get(code)
+            rng = self._range.get(code)
+        if value is None or not rng:
+            return None
+        lo, hi, _ = rng
+        half = max(1.0, (hi - lo) / 2.0)
+        return max(-1.0, min(1.0, (value - (lo + hi) / 2.0) / half))
+
+    def trigger(self, code):
+        """Axis as 0..1 from its minimum, or None when there is no axis."""
+        if code is None:
+            return None
+        with self._lock:
+            value = self._axes.get(code)
+            rng = self._range.get(code)
+        if value is None or not rng:
+            return None
+        lo, hi, _ = rng
+        return max(0.0, min(1.0, (value - lo) / max(1.0, hi - lo)))
 
     def close(self):
         self._stop.set()
 
     # ---- reader thread (and the tests) -----------------------------------
-    def feed(self, ev_type, number, value):
-        """Apply one js event (updates the state, pushes the edge event)."""
-        init = bool(ev_type & self.EV_INIT)
-        ev_type &= ~self.EV_INIT
+    def feed(self, ev_type, code, value):
+        """Apply one evdev event (updates the state, pushes the edge event)."""
         with self._lock:
-            if ev_type == self.EV_BUTTON:
-                self._buttons[number] = value
-            elif ev_type == self.EV_AXIS:
-                self._axes[number] = value
-        if init:
-            return                            # "state so far" burst on open
-        if ev_type == self.EV_BUTTON:
-            self.events.put(("button", number, value))
-        elif ev_type == self.EV_AXIS:
-            last = self._last_ev.get(number, 0)
-            if abs(value - last) > 2000:      # log/drive only significant moves
-                self._last_ev[number] = value
-                self.events.put(("axis", number, value))
+            if ev_type == PAD_EV_KEY:
+                self._buttons[code] = value
+            elif ev_type == PAD_EV_ABS:
+                self._axes[code] = value
+        if ev_type == PAD_EV_KEY:
+            self.events.put(("button", code, value))
+        elif ev_type == PAD_EV_ABS:
+            with self._lock:
+                rng = self._range.get(code)
+            if rng:
+                lo, hi, _ = rng
+                frac = (value - lo) / max(1.0, hi - lo)
+                last = self._last_frac.get(code)
+                if last is None or abs(frac - last) > 0.15:
+                    self._last_frac[code] = frac
+                    self.events.put(("axis", code, value))
 
     def consume(self, data):
-        """Parse raw js_event bytes (used by the reader loop and tests)."""
+        """Parse raw input_event bytes (used by the reader loop and tests)."""
         buf = self._buf + data
-        while len(buf) >= 8:
-            chunk, buf = buf[:8], buf[8:]
-            _, value, ev_type, number = struct.unpack(self.EV_FMT, chunk)
-            self.feed(ev_type, number, value)
+        size = struct.calcsize(self.EV_FMT)
+        while len(buf) >= size:
+            chunk, buf = buf[:size], buf[size:]
+            _, _, ev_type, code, value = struct.unpack(self.EV_FMT, chunk)
+            self.feed(ev_type, code, value)
         self._buf = buf
 
     # ---- device handling -------------------------------------------------
     def _candidates(self):
         if self.want != "auto":
             return [self.want]
-        return sorted(glob.glob("/dev/input/js*"))
+        return sorted(glob.glob("/dev/input/event*"),
+                      key=lambda p: int(p.rsplit("event", 1)[-1] or 0))
 
-    def _name_of(self, path):
+    def _caps(self, fd):
+        """{abs code: (min, max, value)} when the device looks like a gamepad."""
         try:
-            with open("/sys/class/input/%s/device/name" % os.path.basename(path)) as f:
-                return f.read().strip()
-        except Exception:
+            keys = _ev_bits(fd, PAD_EV_KEY, 96)
+            axes = _ev_bits(fd, PAD_EV_ABS, 8)
+        except OSError:
             return None
+        no_buttons = not (keys & set(range(0x120, 0x140)))
+        no_dpad = not (keys & {0x220, 0x221, 0x222, 0x223})
+        if not axes or (no_buttons and no_dpad):
+            return None                  # keyboard/mouse/touchpad/... : skip
+        out = {}
+        for code in sorted(axes):
+            try:
+                info = struct.unpack(
+                    "<6i", fcntl.ioctl(fd, _ev_ioc_read(0x40 + code, 24), b"\0" * 24))
+            except OSError:
+                continue
+            out[code] = (info[1], info[2], info[0])          # min, max, value
+        return out
+
+    def _name_of(self, fd, path):
+        try:
+            buf = fcntl.ioctl(fd, _ev_ioc_read(0x06, 256), b"\0" * 256)
+            name = buf.split(b"\0")[0].decode(errors="replace").strip()
+            if name:
+                return name
+        except OSError:
+            pass
+        return os.path.basename(path)
+
+    def _layout_for(self, ranges):
+        """Which axis plays which role, from the axes the pad declares."""
+        def pick(*codes):
+            for c in codes:
+                if c in ranges:
+                    return c
+            return None
+        if PAD_ABS_GAS in ranges or PAD_ABS_BRAKE in ranges:
+            # dedicated trigger axes (Stadia, ...): Z/RZ are the right stick
+            spin = self.spin_axis if self.spin_axis is not None else pick(PAD_ABS_Z, PAD_ABS_RZ)
+            lt, rt = pick(PAD_ABS_BRAKE), pick(PAD_ABS_GAS)
+        else:
+            # xpad-style: Z/RZ are the triggers, RX is the right stick
+            spin = self.spin_axis if self.spin_axis is not None else pick(PAD_ABS_RX)
+            lt, rt = pick(PAD_ABS_Z), pick(PAD_ABS_RZ)
+        if spin is not None:             # one axis, one job
+            if lt == spin:
+                lt = None
+            if rt == spin:
+                rt = None
+        if lt is not None and lt == rt:
+            rt = None
+        return {"lx": pick(PAD_ABS_X), "ly": pick(PAD_ABS_Y),
+                "spin": spin, "lt": lt, "rt": rt}
+
+    def _layout_text(self):
+        lay = self.layout or {}
+        return ", ".join("%s=%s" % (role, PAD_AXIS_NAMES.get(code, "?%s" % code))
+                         for role, code in sorted(lay.items()) if code is not None)
 
     def _run(self):
         while not self._stop.is_set():
@@ -211,13 +330,29 @@ class Gamepad:
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         except OSError as e:
-            self.note = "cannot open %s (%s)" % (path, e.strerror or e)
+            if e.errno not in (errno.EACCES, errno.ENODEV, errno.ENOENT):
+                self.note = "cannot open %s (%s)" % (path, e.strerror or e)
             return False
         self._buf = b""
-        name = self._name_of(path) or path
-        self.path, self.name, self.note = path, name, name
-        seen, t0 = 0, time.time()
         try:
+            ranges = self._caps(fd)
+            if not ranges:
+                return False                  # not a gamepad
+            name = self._name_of(fd, path)
+            with self._lock:
+                self._range = ranges
+                self._buttons = {}
+                for code, (lo, hi, value) in ranges.items():
+                    # Only trust the value the device reports at open when it is
+                    # inside the axis' range; anything else would look like a
+                    # fully deflected stick (some virtual/uinput pads report 0
+                    # for a 1..255 axis) and could drive the cart on its own.
+                    if lo <= value <= hi:
+                        self._axes[code] = value
+            self.layout = self._layout_for(ranges)
+            self.path, self.name, self.note = path, name, name
+            self.events.put(("device", name, self._layout_text()))
+            seen, t0 = 0, time.time()
             while not self._stop.is_set():
                 try:
                     ready, _, _ = select.select([fd], [], [], 0.5)
@@ -225,22 +360,22 @@ class Gamepad:
                     break
                 if ready:
                     try:
-                        data = os.read(fd, 8 * 64)
+                        data = os.read(fd, 24 * 64)
                     except OSError:
                         break
                     if not data:
                         break
                     self.consume(data)
                     seen += 1
-                elif seen == 0 and time.time() - t0 > 1.5:
-                    break                     # opens but stays silent: not a pad
+                elif seen == 0 and time.time() - t0 > 1.0:
+                    break                     # opens but stays silent
                 elif not os.path.exists(path):
-                    break                     # unplugged while select() was waiting
+                    break                     # unplugged while select() waited
         finally:
             os.close(fd)
-        self.path = self.name = None
+        self.path = self.name = self.layout = None
         if seen == 0:
-            self.note = "%s: no events (not a gamepad?)" % name
+            self.note = "%s: no events (not a gamepad?)" % path
             return False
         return True
 
@@ -433,7 +568,6 @@ class App:
         self._dir_held = {}
         self._key_press = {}
         self._key_release = {}
-        self._key_first = {}                 # first press of the current hold
         self._key_repeat = set()             # movement keys that auto-repeated
         self._pad_down = set()
         self._pad_time = {}
@@ -451,8 +585,10 @@ class App:
         self._wifi_ok = False
         self.log_keys = tk.BooleanVar(value=bool(cfg.get("log_keys", False)))
         self.pad_deadzone = float(cfg.get("pad_deadzone", PAD_DEADZONE))
-        self.pad = Gamepad(str(cfg.get("pad", "auto")))
-        self._stick_time = {}                # pad axis -> (code, engaged time)
+        self.pad_spin = cfg.get("pad_spin", "")
+        self.pad = Gamepad(str(cfg.get("pad", "auto")),
+                           PAD_SPIN_CHOICES.get(self.pad_spin) if self.pad_spin else None)
+        self._stick_engaged = set()          # pad axes currently past the deadzone
         self._pad_repeat = {}                # held pad action -> last run time
 
         root.title("Maixduino cart remote control")
@@ -676,12 +812,13 @@ class App:
 
         help_txt = ("W/S fwd/back   A/D strafe   Q/E spin   Space stop   Esc e-stop   "
                     "R/F big arm   T/G little arm   Y/H rotate   C/V grab/release   "
-                    "1-8 as above   P home   +/- speed   [ ] step   |   mouse: use the "
-                    "drive pad / +/- buttons (keys need the window focused, click it once)"
-                    "\ngamepad (USB or Bluetooth): L-stick drive   R-stick spin   "
+                    "1-8 as above   P home   +/- speed   [ ] step   |   combine them to "
+                    "steer while driving (W+A = diagonal, W+Q = curve); mouse: use the "
+                    "drive pad / +/- buttons (keys need the window focused, click once)"
+                    "\ngamepad (USB or Bluetooth): L-stick drive/steer   R-stick spin   "
                     "A/B clamp grab/release   X home   Y stop   Start e-stop/resume   "
                     "LB/RB little arm   D-pad big arm + rotation   LT/RT speed   "
-                    "(works even when the window is not focused)")
+                    "(analog, works even when the window is not focused)")
         tk.Label(root, text=help_txt, anchor="w", justify="left", fg="#333333").pack(
             fill="x", padx=8, pady=(0, 6))
 
@@ -834,8 +971,6 @@ class App:
             now = time.time()
             if k in self._key_press:             # auto-repeat press (same key down)
                 self._key_repeat.add(k)
-            else:
-                self._key_first[k] = now         # newest input wins by this time
             self._key_press[k] = now
             self._apply_input()                  # react now, not on the next tick
         elif k in SERVO_KEYS:
@@ -886,7 +1021,6 @@ class App:
         if had:
             self._key_press.clear()
             self._key_release.clear()
-            self._key_first.clear()
             self._key_repeat.clear()
             self._pad_down.clear()
             self._pad_time.clear()
@@ -942,7 +1076,6 @@ class App:
     def _stop_all(self):
         self._key_press.clear()
         self._key_release.clear()
-        self._key_first.clear()
         self._key_repeat.clear()
         self._pad_down.clear()
         self._pad_time.clear()
@@ -952,88 +1085,69 @@ class App:
             self._wheel = None
         self._send("stop")
 
-    def _held_directions(self, now):
-        """[(time, code)] for every held movement key / pad button / stick.
+    def _move_vector(self, now):
+        """(x, y, w) drive vector: held keys/buttons plus the gamepad sticks.
 
-        The timestamp is when the input first engaged, so the newest input
-        wins - deterministic even while several keys auto-repeat.
+        x = forward, y = strafe right, w = spin right, each -100..100.  Several
+        inputs add up, so W+A is the forward-left diagonal and W+Q is a left
+        curve while driving - the bot turns the blend into per-wheel duty
+        differentials ('mix' command).
         """
-        out = []
+        x = y = w = 0.0
         for k in list(self._key_press):
             code = MOVE_KEYS.get(k)
             if code and self._key_is_down(k, now):
-                out.append((self._key_first.get(k, self._key_press[k]), code))
+                vx, vy, vw = MOVE_VECTORS[code]
+                x += vx
+                y += vy
+                w += vw
             elif code:
                 del self._key_press[k]
                 self._key_release.pop(k, None)
-                self._key_first.pop(k, None)
                 self._key_repeat.discard(k)
         for code in list(self._pad_down):
-            out.append((self._pad_time.get(code, 0.0), code))
-        for code, t in self._stick_codes(now).items():
-            out.append((t, code))
-        return out
+            vx, vy, vw = MOVE_VECTORS[code]
+            x += vx
+            y += vy
+            w += vw
+        lay = self.pad.layout
+        if lay:
+            x -= self._stick_axis(lay["ly"]) * 100      # stick up = forward
+            y += self._stick_axis(lay["lx"]) * 100      # stick right = strafe right
+            w += self._stick_axis(lay["spin"]) * 100    # right stick right = spin right
+        return x, y, w
 
     # -------------------------------------------------- gamepad mapping ---
-    @staticmethod
-    def _axis_on(value):
-        """Trigger pushed past the threshold.
-
-        joydev scales every axis to -32767..32767, so an axis declared 0..max
-        (the usual analog trigger) rests at -32767 and reads +32767 when fully
-        pulled - only the positive direction counts.
-        """
-        return value > PAD_TRIGGER * 32767
-
-    def _stick_dir(self, axis, neg_code, pos_code, now):
-        """Engaged code for one stick axis, with hysteresis and engage time."""
-        axes, _ = self.pad.state()
-        v = axes.get(axis, 0) / 32767.0
-        code = neg_code if v < 0 else pos_code
-        prev = self._stick_time.get(axis)
-        if prev and prev[0] == code and abs(v) > PAD_RELEASE:
-            return code, prev[1]                     # keep driving
-        if abs(v) >= self.pad_deadzone:
-            self._stick_time[axis] = (code, now)
-            return code, now
-        self._stick_time.pop(axis, None)
-        return None, 0.0
-
-    def _stick_codes(self, now):
-        """{movement code: engaged time} asked for by the gamepad sticks."""
-        axes, _ = self.pad.state()
-        if not axes:
-            return {}
-        if PAD_AXIS_SPIN in axes:
-            spin_axis = PAD_AXIS_SPIN
-        elif PAD_AXIS_RSPIN_FALLBACK in axes:
-            spin_axis = PAD_AXIS_RSPIN_FALLBACK
-        else:
-            spin_axis = None
-        code = t = None
-        if spin_axis is not None:
-            code, t = self._stick_dir(spin_axis, "tl", "tr", now)
-        if code is None and PAD_AXIS_LX in axes and PAD_AXIS_LY in axes:
-            lx, ly = axes.get(PAD_AXIS_LX, 0), axes.get(PAD_AXIS_LY, 0)
-            if abs(ly) >= abs(lx):                   # dominant axis drives
-                code, t = self._stick_dir(PAD_AXIS_LY, "f", "b", now)
-            else:
-                code, t = self._stick_dir(PAD_AXIS_LX, "l", "r", now)
-        return {code: t} if code else {}
+    def _stick_axis(self, axis):
+        """One analog axis as -1..1 with deadzone + hysteresis (0 = centred)."""
+        value = self.pad.stick(axis)
+        if value is None:
+            return 0.0
+        if axis in self._stick_engaged:
+            if abs(value) < PAD_RELEASE:
+                self._stick_engaged.discard(axis)
+                return 0.0
+            return value
+        if abs(value) >= self.pad_deadzone:
+            self._stick_engaged.add(axis)
+            return value
+        return 0.0
 
     def _pad_arm_tick(self, now):
         """Held pad buttons / D-pad repeat the arm nudge every PAD_REPEAT_S."""
-        axes, buttons = self.pad.state()
+        _, buttons = self.pad.state()
         actions = []
-        for num, action in PAD_HOLD.items():
-            if buttons.get(num):
-                actions.append((("btn", num), action))
-        for number in (PAD_AXIS_HATX, PAD_AXIS_HATY):
-            v = axes.get(number, 0)
-            if v <= -PAD_HAT:
-                actions.append((("hat", number, -1), PAD_HAT_ACTIONS[(number, -1)]))
-            elif v >= PAD_HAT:
-                actions.append((("hat", number, +1), PAD_HAT_ACTIONS[(number, +1)]))
+        for code, action in PAD_HOLD.items():
+            if buttons.get(code):
+                actions.append((("btn", code), action))
+        for axis in (PAD_ABS_HAT0X, PAD_ABS_HAT0Y):
+            value = self.pad.stick(axis)
+            if value is None:
+                continue
+            if value <= -PAD_HAT:
+                actions.append((("hat", axis, -1), PAD_HAT_ACTIONS[(axis, -1)]))
+            elif value >= PAD_HAT:
+                actions.append((("hat", axis, +1), PAD_HAT_ACTIONS[(axis, +1)]))
         for key, action in actions:
             if now - self._pad_repeat.get(key, 0.0) > PAD_REPEAT_S:
                 self._pad_repeat[key] = now
@@ -1041,9 +1155,11 @@ class App:
 
     def _pad_speed_trim(self, now):
         """Triggers trim the speed slider while held (LT down, RT up)."""
-        axes, _ = self.pad.state()
-        for key, axis, delta in (("spd-", PAD_AXIS_LT, -5), ("spd+", PAD_AXIS_RT, +5)):
-            if self._axis_on(axes.get(axis, 0)) and now - self._pad_repeat.get(key, 0.0) > PAD_REPEAT_S:
+        lay = self.pad.layout or {}
+        for key, axis, delta in (("spd-", lay.get("lt"), -5), ("spd+", lay.get("rt"), +5)):
+            travel = self.pad.trigger(axis)
+            if travel is not None and travel >= PAD_TRIGGER \
+                    and now - self._pad_repeat.get(key, 0.0) > PAD_REPEAT_S:
                 self._pad_repeat[key] = now
                 self._set_speed(max(0, min(100, int(float(self.speed.get())) + delta)))
 
@@ -1058,12 +1174,19 @@ class App:
         elif what == "estop":
             self._toggle_estop()
 
-    def _pad_event(self, kind, number, value):
+    def _pad_event(self, kind, code, value):
         """One gamepad edge event, run in the Tk thread."""
+        if kind == "device":
+            self.log("pad: %s  [%s]" % (code, value), "ok")
+            return
         if self.log_keys.get():
-            self.log("pad: %s %d -> %s" % (kind, number, value))
+            if kind == "axis":
+                name = PAD_AXIS_NAMES.get(code, "axis %d" % code)
+            else:
+                name = PAD_BTN_NAMES.get(code, "button %d" % code)
+            self.log("pad: %s %s -> %s" % (kind, name, value))
         if kind == "button" and value:
-            action = PAD_BUTTONS.get(number)
+            action = PAD_BUTTONS.get(code)
             if action:
                 self._run_pad_action(action)
 
@@ -1073,14 +1196,14 @@ class App:
 
     # --------------------------------------------------------- drive tick ---
     def _apply_input(self):
-        """Send the movement the current input state (keys, pad, wheel test)
-        asks for.  Runs every DRIVE_TICK_MS and again right after a press, so
-        the cart reacts immediately instead of waiting for the next tick.
+        """Send the motion the current input state (keys, mouse pad, gamepad,
+        wheel test) asks for.  Runs every DRIVE_TICK_MS and again right after a
+        press, so the cart reacts immediately instead of waiting for the tick.
         """
         now = time.time()
         self._pad_speed_trim(now)
         self._pad_arm_tick(now)
-        held = self._held_directions(now)
+        x, y, w = self._move_vector(now)
         if not self.link.connected or self.estop_latched:
             self._moving = False
             return
@@ -1090,10 +1213,9 @@ class App:
                                                int(float(self.speed.get()))))
             self._moving = True
             return
-        if held:
-            _, code = max(held, key=lambda item: item[0])
+        if abs(x) > 0.5 or abs(y) > 0.5 or abs(w) > 0.5:
             speed = int(float(self.speed.get()))
-            brake = (self.brake_on.get() and code == "f" and self._last_dist is not None
+            brake = (self.brake_on.get() and x > 0.5 and self._last_dist is not None
                      and self._last_dist <= int(self.brake_cm.get()))
             if brake:
                 if self._moving or now - self._brake_logged > 1.0:
@@ -1102,13 +1224,28 @@ class App:
                     self._send("stop")
                 self._moving = False
             else:
-                if not self._moving:
-                    self.log("-> move %s @ %d" % (MOVE_LABEL.get(code, code), speed))
-                self.link.send("move %s %d" % (code, speed))
+                self._send_drive(x, y, w, speed)
                 self._moving = True
         elif self._moving:
             self._send("stop")
             self._moving = False
+
+    def _send_drive(self, x, y, w, speed):
+        """One drive step: 'move' for a single component (older bots understand
+        it too), 'mix' when several inputs blend - steering on the fly."""
+        x, y, w = int(round(x)), int(round(y)), int(round(w))
+        if len([c for c in (x, y, w) if c]) == 1:
+            axis = 0 if x else (1 if y else 2)      # exactly one input: plain move
+            value = (x, y, w)[axis]
+            code = {0: ("b", "f"), 1: ("l", "r"), 2: ("tl", "tr")}[axis][value > 0]
+            spd = max(1, int(round(abs(value) * speed / 100.0)))
+            if not self._moving:
+                self.log("-> move %s @ %d" % (MOVE_LABEL[code], spd))
+            self.link.send("move %s %d" % (code, spd))
+        else:
+            if not self._moving:
+                self.log("-> mix fwd=%d strafe=%d spin=%d @ %d" % (x, y, w, speed))
+            self.link.send("mix %d %d %d %d" % (x, y, w, speed))
 
     def _drive_tick(self):
         """Keep the input->cart path alive while a key/button is held."""
@@ -1292,6 +1429,7 @@ class App:
             "brake": bool(self.brake_on.get()), "brake_cm": int(self.brake_cm.get()),
             "thr": self.thr_var.get(), "log_keys": bool(self.log_keys.get()),
             "pad": self.pad.want, "pad_deadzone": self.pad_deadzone,
+            "pad_spin": self.pad_spin,
         }
         try:
             with open(SETTINGS, "w") as f:

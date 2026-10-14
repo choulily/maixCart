@@ -133,6 +133,29 @@ app._wheel_release("A")
 settle(0.2)
 check(any(c == "motor A r 55" for c in sent), "reverse wheel button sends 'motor A r'")
 
+# ---- steering: two directions blend into a 'mix' -----------------------------
+sent[:] = []
+press("w")
+settle(0.15)
+press("a")
+settle(0.15)
+check(any(c == "mix 100 -100 0 55" for c in sent),
+      "W+A blends into a forward-left 'mix' (%r)" % sent[-3:])
+release("a")
+settle(0.20)
+check(any(c == "move f 55" for c in sent), "releasing A falls back to 'move f'")
+press("q")
+settle(0.15)
+check(any(c == "mix 100 0 -100 55" for c in sent), "W+Q blends into a left curve")
+release("q")
+press("s")
+settle(0.15)
+check(any(c == "stop" in c or c == "stop" for c in sent),
+      "W+S cancels out -> 'stop'")
+release("s")
+release("w")
+settle(0.3)
+
 # ---- typing mode: keys are ignored while a text field has focus ---------------
 sent[:] = []
 app.root.focus_force()

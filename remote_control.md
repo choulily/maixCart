@@ -49,6 +49,32 @@ Keyboard input stops driving while you are typing in a text field (the status
 line tells you); click the window background to drive again.  Movement keeps
 being sent while a key is held; when you let go, the wheels stop.
 
+**Steering while driving / 边走边转向:** held directions *combine* instead of
+replacing each other, so `W`+`A` is the forward-left diagonal and `W`+`Q`
+drives forward while spinning left (a curve).  The GUI sends the blend to the
+bot, which gives every wheel its own duty - the mecanum "RPM differential"
+(`mix` in the protocol table below).  Two opposite keys cancel out; releasing
+one key falls back to the remaining one.
+
+### How the steering mix works / 混合驱动原理
+
+The bot describes any motion with three signed components - forward `x`,
+strafe-right `y`, spin-right `w`, each −100…100 - and each wheel is the sum of
+its three signed parts:
+
+| wheel | components | straight | diagonal fwd-right | curve fwd + spin right |
+|-------|-----------|----------|--------------------|------------------------|
+| A | `x + y + w` | 55 | 55 | 55 |
+| B | `x − y − w` | 55 | 0  | 0 |
+| C | `x − y + w` | 55 | 0  | 55 |
+| D | `x + y − w` | 55 | 55 | 0 |
+
+The fastest wheel always turns at the drive speed (the rest are scaled down
+proportionally), so blending never exceeds the speed you set - the *difference*
+between the wheels is what curves the cart.  `move f`/`l`/`tl`/… is the same
+maths with a single component; the full table and the offline test are in
+`tools/test_bot_mixing.py`.
+
 **Keyboard focus (Wayland / XWayland):** Tk 8.6 has no Wayland backend, so this
 window runs through X11 compatibility (XWayland) and only receives keys while it
 is the **focused** window.  The GUI shows the state on its third line:
@@ -83,14 +109,16 @@ and the ESP32 brown out if the motors draw current too abruptly.
 
 A game controller connected to **this laptop** works as an input method next to
 the keyboard and the mouse pad.  Pair/plug it with the desktop first (Bluetooth
-settings, or just the USB cable); the GUI picks up the Linux joystick device
-(`/dev/input/js*`) on its own - no extra software, no configuration.  The third
-status line shows `pad: <name>` (or `pad: none found ...`).
+settings, or just the USB cable); the GUI reads the Linux event device
+(`/dev/input/event*`) on its own - no extra software, no configuration.  The
+third status line shows `pad: <name>`, and the log line
+`pad: <name> [lx=ABS_X, ly=ABS_Y, spin=ABS_Z, ...]` tells you which axis the
+GUI picked for what (handy when a pad wires things unusually).
 
 | Controller | Action |
 |------------|--------|
-| left stick | drive: forward/backward + strafe (the dominant axis wins) |
-| right stick X | spin left / right |
+| left stick | **analog drive**: forward/backward + strafe at once (push it diagonally to steer while driving) |
+| right stick X | **analog spin** left / right (adds to the drive vector = curve while moving) |
 | `A` / `B` | clamp grab / release |
 | `X` | home pose (`SERVO_HOME`) |
 | `Y` | stop the wheels (like `Space`) |
@@ -100,29 +128,33 @@ status line shows `pad: <name>` (or `pad: none found ...`).
 | D-pad ←/→ | arm rotation left / right (repeats while held) |
 | `LT` / `RT` | drive speed − / + (repeats while held) |
 
-The sticks drive the cart exactly like a held key (same watchdog, same
-auto-brake), so releasing a stick stops the wheels.  Unlike the keyboard the
-controller **keeps working while the window is not focused** - convenient when
-you watch the cart instead of the screen - so only use a controller you can
-reach quickly, and remember `Start` = E-STOP.
+The stick values are analog: half a stick sends roughly half the slider speed,
+and pushing the left stick off-centre while the right stick spins gives a
+smooth curve - the bot receives the three components and gives every wheel its
+own duty (`mix` below).  Releasing a stick stops the wheels (same watchdog and
+auto-brake as the keys).  Unlike the keyboard the controller **keeps working
+while the window is not focused** - convenient when you watch the cart instead
+of the screen - so only use a controller you can reach quickly, and remember
+`Start` = E-STOP.
 
-Controller numbers differ between models: tick **log keys** and watch the
-`pad: button/axis N -> value` lines, then adjust `PAD_BUTTONS`, `PAD_HOLD`,
-`PAD_AXIS_*` and `PAD_HAT_ACTIONS` at the top of `tools/remote_gui.py` (and
-`PAD_DEADZONE` / `PAD_RELEASE` for the sticks).  Settings can also be put in
-`tools/.remote_gui.json` (`"pad": "/dev/input/js0"` to pin a device,
-`"pad_deadzone": 0.35`).
+The reader uses the standardised evdev codes (`BTN_SOUTH`, `ABS_X`, `ABS_HAT0Y`,
+...) plus each axis' min/max, so Xbox-style pads, DualShock/DualSense, 8BitDo
+and the Google Stadia all map the same way.  Tick **log keys** to see what a pad
+sends (`pad: axis ABS_Z -> ...`, `pad: button BTN_NORTH(X) -> 1`), then adjust
+`PAD_BUTTONS`, `PAD_HOLD`, `PAD_HAT_ACTIONS` and the `PAD_ABS_*` roles at the
+top of `tools/remote_gui.py`.  Settings in `tools/.remote_gui.json`:
+`"pad": "/dev/input/event4"` pins a device, `"pad_deadzone": 0.35` changes the
+stick deadzone, and `"pad_spin": "ABS_RZ"` (or `ABS_RX`) overrides which axis
+the right stick uses when a pad reports it on another axis.
 
 Notes / 注意:
 
-* An **Xbox-style layout** (Mad Catz, 8BitDo, DualShock/DualSense, Google
-  Stadia, ...) works out of the box; the Stadia pairs with `Stadia + Y` held
-  until the light blinks (Bluetooth) or just works over USB-C.  Over Bluetooth
-  some pads report the triggers as digital buttons - the log shows what yours
-  sends.
-* No `pad:` line at all?  Check `ls /dev/input/js*` (plug in first) and that
-  the device is readable (`crw-rw-r-- root input`).  No `js*` file means the
-  `joydev` kernel module is missing.
+* **Google Stadia**: pair with `Stadia + Y` held until the light blinks
+  (Bluetooth) or just use the USB-C cable.  Over Bluetooth its right stick
+  arrives on `ABS_Z`/`ABS_RZ` and the triggers on `ABS_GAS`/`ABS_BRAKE` - both
+  are handled automatically (the log shows the layout it found).
+* No `pad:` line at all?  Check `ls -l /dev/input/event*` (plug in first) and
+  that the device is readable (`crw-rw-r-- root input`).
 * The controller **cannot** be connected to the cart's ESP32: that module runs
   the WiFi + tracker-ADC firmware over an SPI link to the K210, so it cannot
   act as a Bluetooth HID host.  A controller on the *laptop* (this feature) or
@@ -131,9 +163,10 @@ Notes / 注意:
   in range.
 
 The GUI's input logic can be re-checked without any hardware:
-`python3 tools/test_gui_logic.py` (keys / mouse pad / focus / wheel buttons) and
-`python3 tools/test_gui_pad.py` (latency + a virtual gamepad created through
-`/dev/uinput`).  Both need a display and no cart.
+`python3 tools/test_gui_logic.py` (keys / mouse pad / focus / wheel buttons /
+steering mixes) and `python3 tools/test_gui_pad.py` (latency + a virtual
+Stadia-like gamepad created through `/dev/uinput`).  Both need a display and no
+cart; `python3 tools/test_bot_mixing.py` checks the mecanum maths offline.
 
 ## Safety / 安全
 
@@ -163,6 +196,7 @@ One command per line, from the GUI to the bot:
 | Command | Meaning |
 |---------|---------|
 | `move <f\|b\|l\|r\|tl\|tr> [speed]` | drive; must be repeated at least every 600 ms (the GUI re-sends it every 60 ms while an input is held) |
+| `mix <fwd> <strafe> <spin> [speed]` | steer while driving: three components −100…100 (forward, strafe right, spin right) blended into per-wheel duty differentials; same watchdog as `move` |
 | `stop` | stop the wheels |
 | `srv <name> <deg>` | servo to an absolute angle (`big_arm`, `little_arm`, `rotation`, `clamp`, 1…4) |
 | `nudge <name> <delta>` | move a servo by a relative angle |

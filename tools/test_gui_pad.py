@@ -1,14 +1,18 @@
-"""End-to-end test: input latency + gamepad support for tools/remote_gui.py.
+"""End-to-end test: input latency + gamepad support + steering mixes.
 
 * latency: a key press must send 'move' immediately (no tick wait), a tap must
   stop quickly, and a held key must keep repeating (~DRIVE_TICK_MS).
-* gamepad: a virtual Xbox-style pad is created through /dev/uinput (no hardware
-  needed), then stick / button / D-pad / trigger events are fed through the
-  real reader thread and the commands the GUI sends are checked.
+* gamepad: a virtual pad with a *Stadia-like* evdev layout (right stick on
+  ABS_Z/RZ, triggers on ABS_GAS/BRAKE, D-pad hat) is created through
+  /dev/uinput - no hardware needed.  The reader must pick the right axes from
+  the device's declared ranges, and the commands the GUI sends are checked.
+* steering: single inputs send plain 'move' (with the analog speed), blends
+  send 'mix fwd strafe spin' so the cart steers while driving.
 
 Run:  python3 tools/test_gui_pad.py   (needs a display and a writable /dev/uinput)
 """
 import fcntl
+import glob
 import os
 import struct
 import sys
@@ -35,18 +39,21 @@ UI_SET_KEYBIT = 0x40045565
 UI_SET_ABSBIT = 0x40045567
 EV_SYN, EV_KEY, EV_ABS = 0x00, 0x01, 0x03
 ABS_CNT = 0x40
-ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ = 0x00, 0x01, 0x02, 0x03, 0x04, 0x05
+ABS_X, ABS_Y, ABS_Z, ABS_RZ = 0x00, 0x01, 0x02, 0x05
+ABS_GAS, ABS_BRAKE = 0x09, 0x0a
 ABS_HAT0X, ABS_HAT0Y = 0x10, 0x11
 BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST = 0x130, 0x131, 0x133, 0x134
 BTN_TL, BTN_TR, BTN_SELECT, BTN_START = 0x136, 0x137, 0x13a, 0x13b
 BUS_USB = 0x03
+NAME = "MaixCart Virtual Gamepad"
 
 
 class VirtualPad:
-    """Xbox-style pad (js numbering: A=0 B=1 X=2 Y=3 LB=4 RB=5 Back=6 Start=7,
-    LX=0 LY=1 LT=2 RX=3 RY=4 RT=5 hatX=6 hatY=7)."""
+    """Stadia-like pad: left stick ABS_X/Y, right stick ABS_Z/RZ (1..255,
+    centred at 128), triggers ABS_GAS (RT) / ABS_BRAKE (LT) 0..255, D-pad on
+    the ABS_HAT0 axes, Xbox-style buttons."""
 
-    def __init__(self, name="MaixCart Virtual Gamepad"):
+    def __init__(self, name=NAME):
         dev = bytearray(struct.pack("<80sHHHHI", name.encode(), BUS_USB,
                                     0x1234, 0x5678, 1, 0))
         dev += b"\x00" * (4 * ABS_CNT * 4)      # absmax/min/fuzz/flat tables
@@ -56,21 +63,31 @@ class VirtualPad:
         for b in (BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST,
                   BTN_TL, BTN_TR, BTN_SELECT, BTN_START):
             fcntl.ioctl(self.fd, UI_SET_KEYBIT, b)
-        for a, lo, hi in ((ABS_X, -32767, 32767), (ABS_Y, -32767, 32767),
-                          (ABS_RX, -32767, 32767), (ABS_RY, -32767, 32767),
-                          (ABS_Z, 0, 255), (ABS_RZ, 0, 255),
+        for a, lo, hi in ((ABS_X, 1, 255), (ABS_Y, 1, 255), (ABS_Z, 1, 255),
+                          (ABS_RZ, 1, 255), (ABS_GAS, 0, 255), (ABS_BRAKE, 0, 255),
                           (ABS_HAT0X, -1, 1), (ABS_HAT0Y, -1, 1)):
             fcntl.ioctl(self.fd, UI_SET_ABSBIT, a)
             struct.pack_into("<i", dev, 92 + a * 4, hi)            # absmax
             struct.pack_into("<i", dev, 92 + 256 + a * 4, lo)      # absmin
         os.write(self.fd, bytes(dev))
         fcntl.ioctl(self.fd, UI_DEV_CREATE)
+        for a in (ABS_X, ABS_Y, ABS_Z, ABS_RZ):        # report a real rest state
+            self.emit(EV_ABS, a, 128)
+        for a in (ABS_GAS, ABS_BRAKE, ABS_HAT0X, ABS_HAT0Y):
+            self.emit(EV_ABS, a, 0)
 
     def emit(self, ev_type, code, value):
         os.write(self.fd, struct.pack("<qqHHi", 0, 0, ev_type, code, value))
         os.write(self.fd, struct.pack("<qqHHi", 0, 0, EV_SYN, 0, 0))
 
-    def axis(self, code, value):
+    def stick(self, code, value):
+        """value -1..1 -> the axis' 1..255 range (0 stays centred)."""
+        self.emit(EV_ABS, code, 128 + int(round(max(-1.0, min(1.0, value)) * 127)))
+
+    def trigger(self, code, value):
+        self.emit(EV_ABS, code, int(round(max(0.0, min(1.0, value)) * 255)))
+
+    def hat(self, code, value):
         self.emit(EV_ABS, code, value)
 
     def button(self, code, value):
@@ -84,28 +101,38 @@ class VirtualPad:
         os.close(self.fd)
 
 
+def event_path_of(name):
+    """The /dev/input/eventN node of the (virtual) pad called `name`."""
+    for path in sorted(glob.glob("/sys/class/input/event*/device/name")):
+        try:
+            with open(path) as f:
+                if f.read().strip() == name:
+                    return "/dev/input/" + path.split("/")[4]
+        except OSError:
+            continue
+    return None
+
+
 print("creating the virtual gamepad ...")
 try:
     pad = VirtualPad()
 except OSError as e:
     print("SKIP: cannot create a virtual pad on /dev/uinput (%s)" % e)
     sys.exit(0)
+path = None
 t0 = time.time()
-while not os.path.exists("/dev/input/js0") and time.time() - t0 < 3:
+while path is None and time.time() - t0 < 3:
+    path = event_path_of(NAME)
     time.sleep(0.05)
-if not os.path.exists("/dev/input/js0"):
-    print("SKIP: no /dev/input/js0 appeared - is the joydev module loaded?")
+if path is None:
+    print("SKIP: the virtual pad did not show up in /dev/input")
     pad.close()
     sys.exit(0)
-print("  .. /dev/input/js0 exists")
-import stat
-mode = os.stat("/dev/input/js0").st_mode
-print("  .. permissions %s (can this user open it? %s)" % (
-    stat.filemode(mode), os.access("/dev/input/js0", os.R_OK)))
+print("  .. virtual pad at %s" % path)
 
 # ------------------------------------------------------------- GUI ----
 root = tk.Tk()
-app = rg.App(root, {"port": 6152, "log_keys": False})
+app = rg.App(root, {"port": 6152, "log_keys": False, "pad": path})
 sent = []
 app.link.send = lambda cmd: sent.append((time.time(), cmd))
 type(app.link).connected = property(lambda self: True)
@@ -127,15 +154,18 @@ def release(k):
 
 
 def since(t, pred):
-    """First (dt, cmd) matching pred after time t, or (None, None)."""
     for ts, cmd in sent:
         if ts >= t and pred(cmd):
             return ts - t, cmd
     return None, None
 
 
+def log_text():
+    return app.logbox.get("1.0", "end")
+
+
 print()
-print("--- latency: key press ---")
+print("--- latency: key press / tap / hold ---")
 sent[:] = []
 t0 = time.time()
 press("w")
@@ -147,8 +177,6 @@ release("w")
 settle(0.4)
 check(sent[-1][1] == "stop", "release ends with 'stop'")
 
-print()
-print("--- latency: tapped key (press+release fast) ---")
 sent[:] = []
 press("s")
 root.update()
@@ -157,11 +185,9 @@ release("s")
 t_rel = time.time()
 settle(0.4)
 dt, cmd = since(t_rel, lambda c: c == "stop")
-check(cmd is not None, "tap stop sent")
-check(dt is not None and dt < 0.20, "  ... within 200 ms of release (%.0f ms)" % ((dt or 9) * 1000))
+check(cmd is not None and dt < 0.20, "tapped key stops within 200 ms (%.0f ms)"
+      % ((dt or 9) * 1000))
 
-print()
-print("--- latency: held key repeat rate ---")
 sent[:] = []
 press("w")
 settle(0.6)
@@ -170,53 +196,98 @@ settle(0.3)
 moves = [c for _, c in sent if c.startswith("move f")]
 check(len(moves) >= 8, "held key re-sends ~every %d ms (%d sends in 0.6 s)"
       % (rg.DRIVE_TICK_MS, len(moves)))
-check(sent[-1][1] == "stop", "held key stops after release")
 
 print()
-print("--- gamepad discovery ---")
-t0 = time.time()
-while app.pad.path is None and time.time() - t0 < 5:
-    settle(0.1)
-check(app.pad.path == "/dev/input/js0", "reader opened %r" % app.pad.path)
-check(app.pad.name == "MaixCart Virtual Gamepad", "device name %r" % app.pad.name)
-check("Virtual Gamepad" in app.pad.note, "status note %r" % app.pad.note)
-
-print()
-print("--- gamepad: left stick drives ---")
+print("--- steering mixes from the keyboard ---")
 sent[:] = []
-pad.axis(ABS_Y, -32767)                     # stick up = forward
-settle(0.25)
-pad.axis(ABS_Y, 0)
+press("w")
+settle(0.15)
+press("a")
+settle(0.15)
+check(any(c == "mix 100 -100 0 55" for _, c in sent),
+      "W+A -> forward-left diagonal (%r)" % [c for _, c in sent][-3:])
+release("a")
+settle(0.15)
+check(any(c == "move f 55" for _, c in sent),
+      "releasing A falls back to plain 'move f'")
+press("q")
+settle(0.15)
+check(any(c == "mix 100 0 -100 55" for _, c in sent),
+      "W+Q -> curve left while driving")
+release("q")
+release("w")
 settle(0.3)
-check(any(c == "move f 55" for _, c in sent), "stick up -> 'move f' (%r)" % sent[:3])
-check(sent[-1][1] == "stop", "stick back to center -> 'stop'")
-
-sent[:] = []
-pad.axis(ABS_X, 32767)                      # stick right = strafe right
-settle(0.2)
-pad.axis(ABS_X, 0)
-settle(0.25)
-check(any(c == "move r 55" for _, c in sent), "stick right -> 'move r'")
+check(sent[-1][1] == "stop", "all keys released -> 'stop'")
 
 print()
-print("--- gamepad: right stick spins ---")
-sent[:] = []
-pad.axis(ABS_RX, 32767)
-settle(0.2)
-pad.axis(ABS_RX, 0)
-settle(0.25)
-check(any(c == "move tr 55" for _, c in sent), "right stick -> 'move tr'")
+print("--- gamepad discovery and axis layout ---")
+t0 = time.time()
+while app.pad.layout is None and time.time() - t0 < 4:
+    settle(0.1)
+lay = app.pad.layout or {}
+check(app.pad.name == NAME, "reader opened the virtual pad (%r)" % app.pad.name)
+check(app.pad.path == path, "device path %r" % app.pad.path)
+check(lay.get("lx") == ABS_X and lay.get("ly") == ABS_Y, "left stick = ABS_X/Y (%s)" % lay)
+check(lay.get("spin") == ABS_Z, "right stick (spin) = ABS_Z (%s)" % lay)
+check(lay.get("rt") == ABS_GAS and lay.get("lt") == ABS_BRAKE,
+      "triggers = ABS_GAS/BRAKE (%s)" % lay)
+check("spin=ABS_Z" in log_text() and "RT" in log_text(),
+      "layout logged for the user")
 
 print()
-print("--- gamepad: face buttons, start, and the little arm ---")
+print("--- gamepad: sticks drive and steer ---")
+sent[:] = []
+pad.stick(ABS_Y, -1.0)                      # full forward
+settle(0.25)
+pad.stick(ABS_Y, 0.0)
+settle(0.3)
+check(any(c == "move f 55" for _, c in sent), "left stick up -> 'move f' (%r)" % sent[:3])
+check(sent[-1][1] == "stop", "stick back to centre -> 'stop'")
+
+sent[:] = []
+pad.stick(ABS_X, 1.0)                       # full right
+settle(0.2)
+pad.stick(ABS_X, 0.0)
+settle(0.25)
+check(any(c == "move r 55" for _, c in sent), "left stick right -> 'move r'")
+
+sent[:] = []
+pad.stick(ABS_Y, -0.6)                      # analog: 60 % forward
+settle(0.2)
+check(any(c == "move f 33" for _, c in sent),
+      "60 %% stick -> analog 'move f 33' (%r)" % sent[:2])
+pad.stick(ABS_Y, 0.0)
+settle(0.25)
+
+sent[:] = []
+pad.stick(ABS_Y, -1.0)
+pad.stick(ABS_X, 1.0)
+settle(0.25)
+check(any(c == "mix 100 100 0 55" for _, c in sent),
+      "stick diagonal -> 'mix' diagonal (%r)" % sent[:2])
+pad.stick(ABS_Y, 0.0)
+pad.stick(ABS_X, 0.0)
+settle(0.3)
+
+sent[:] = []
+pad.stick(ABS_Y, -1.0)
+pad.stick(ABS_Z, 1.0)                       # drive + spin = curve
+settle(0.25)
+check(any(c == "mix 100 0 100 55" for _, c in sent),
+      "stick + right stick -> 'mix' curve (%r)" % sent[:2])
+pad.stick(ABS_Y, 0.0)
+pad.stick(ABS_Z, 0.0)
+settle(0.3)
+
+print()
+print("--- gamepad: buttons, D-pad, triggers ---")
 sent[:] = []
 pad.button(BTN_SOUTH, 1)
 settle(0.15)
 pad.button(BTN_SOUTH, 0)
-settle(0.1)
 check(any(c == "grab" for _, c in sent), "A -> 'grab'")
 sent[:] = []
-pad.button(BTN_NORTH, 1)                    # X = home
+pad.button(BTN_NORTH, 1)
 settle(0.15)
 pad.button(BTN_NORTH, 0)
 check(any(c == "home" for _, c in sent), "X -> 'home'")
@@ -228,7 +299,7 @@ check(any(c == "estop" for _, c in sent), "Start -> 'estop'")
 app._resume()
 settle(0.1)
 sent[:] = []
-pad.button(BTN_WEST, 1)                     # Y = stop wheels
+pad.button(BTN_WEST, 1)
 settle(0.15)
 pad.button(BTN_WEST, 0)
 check(any(c == "stop" for _, c in sent), "Y -> 'stop'")
@@ -240,38 +311,46 @@ settle(0.1)
 n = len([c for _, c in sent if c.startswith("nudge little_arm")])
 check(n >= 2, "LB held -> repeated little-arm nudges (%d)" % n)
 
-print()
-print("--- gamepad: D-pad arm, triggers, unplug ---")
 sent[:] = []
-pad.axis(ABS_HAT0Y, -1)                     # D-pad up = big arm up
+pad.hat(ABS_HAT0Y, -1)                      # D-pad up = big arm up
 settle(0.15)
-pad.axis(ABS_HAT0Y, 0)
+pad.hat(ABS_HAT0Y, 0)
 settle(0.1)
 check(any(c.startswith("nudge big_arm") for _, c in sent), "D-pad up -> big arm nudge")
 sent[:] = []
-pad.axis(ABS_HAT0X, 1)                      # D-pad right = rotate right
+pad.hat(ABS_HAT0X, 1)                       # D-pad right = rotate right
 settle(0.15)
-pad.axis(ABS_HAT0X, 0)
+pad.hat(ABS_HAT0X, 0)
 settle(0.1)
 check(any(c.startswith("nudge rotation") for _, c in sent), "D-pad right -> rotation nudge")
+
 sent[:] = []
 before = int(float(app.speed.get()))
-pad.axis(ABS_RZ, 255)                       # right trigger = speed up
+pad.trigger(ABS_GAS, 1.0)                   # RT = speed up
 settle(0.4)
-pad.axis(ABS_RZ, 0)
+pad.trigger(ABS_GAS, 0.0)
 settle(0.2)
-check(int(float(app.speed.get())) > before, "RT -> speed %d -> %d"
-      % (before, int(float(app.speed.get()))))
+after_up = int(float(app.speed.get()))
+check(after_up > before, "RT -> speed %d -> %d" % (before, after_up))
+sent[:] = []
+pad.trigger(ABS_BRAKE, 1.0)                 # LT = speed down
+settle(0.4)
+pad.trigger(ABS_BRAKE, 0.0)
+settle(0.2)
+check(int(float(app.speed.get())) < after_up,
+      "LT -> speed %d -> %d" % (after_up, int(float(app.speed.get()))))
 
+print()
+print("--- unplug ---")
 pad.close()
 t0 = time.time()
 while app.pad.path is not None and time.time() - t0 < 6:
     settle(0.1)
-settle(0.5)                                   # let the reader update its note
+settle(0.5)
 print("  .. note after unplug: %r" % app.pad.note)
 check("none" in app.pad.note or "no gamepad" in app.pad.note,
-      "unplugged pad falls back to scanning (%r)" % app.pad.note)
-check(app.pad.path is None, "no stale device path")
+      "unplugged pad falls back to scanning")
+check(app.pad.layout is None, "no stale axis layout")
 
 print()
 print("FAILED: %d" % len(fails))

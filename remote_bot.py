@@ -18,6 +18,9 @@
 #
 # Motors / 电机 (Timer0 + Timer1, 500 kHz, duty = speed 0-100):
 #   A: IO21/IO22   B: IO23/IO24   C: IO15/IO32   D: IO14/IO13
+#   * 'move <code>' drives one of the six movements; 'mix <fwd> <strafe> <spin>'
+#     blends them (each -100..100) so the cart can be steered while it drives:
+#     the wheels get per-wheel duty differentials, see WHEEL_MIX below.
 #   * INVERT_ALL_MOTORS = True: this cart's wheels turn mirrored compared with the
 #     vendor docs, so the forward/reverse roles are swapped here ("move f" really
 #     goes forward on this cart).
@@ -153,18 +156,42 @@ MOTOR_PWM_CH = {
     14: (Timer.TIMER1, Timer.CHANNEL2), 13: (Timer.TIMER1, Timer.CHANNEL3),
 }
 
-# movement -> per-motor direction, from movement_reference.md
-#   F = forward pin gets the duty, R = reverse pin gets it
-MOVE_PATTERNS = {
-    "f":  {"A": "F", "B": "F", "C": "F", "D": "F"},
-    "b":  {"A": "R", "B": "R", "C": "R", "D": "R"},
-    "l":  {"A": "R", "B": "F", "C": "F", "D": "R"},
-    "r":  {"A": "F", "B": "R", "C": "R", "D": "F"},
-    "tl": {"A": "R", "B": "F", "C": "R", "D": "F"},
-    "tr": {"A": "F", "B": "R", "C": "F", "D": "R"},
+# Mecanum mixing / 麦克纳姆轮混合驱动 (movement_reference.md)
+#   Every movement - and any blend of them while driving - is a combination of
+#   three signed axes:
+#       x = forward (+) / backward (-)
+#       y = strafe right (+) / strafe left (-)
+#       w = spin right (+) / spin left (-)
+#   Each wheel sees the sum of its three components (WHEEL_MIX below), which is
+#   the classic mecanum "RPM differential": e.g. x=+100, w=+100 gives A/C the
+#   full duty and B/D zero, and the cart turns right while it drives forward.
+WHEEL_MIX = {                 # wheel -> (x sign, y sign, w sign)
+    "A": (+1, +1, +1),
+    "B": (+1, -1, -1),
+    "C": (+1, -1, +1),
+    "D": (+1, +1, -1),
+}
+MOVE_VECTORS = {              # movement code -> (x, y, w) at full deflection
+    "f":  (100, 0, 0), "b": (-100, 0, 0),
+    "l":  (0, -100, 0), "r": (0, 100, 0),
+    "tl": (0, 0, -100), "tr": (0, 0, 100),
 }
 MOVE_NAMES = {"f": "forward", "b": "backward", "l": "strafe left", "r": "strafe right",
               "tl": "spin left", "tr": "spin right"}
+
+
+def mix_pattern(x, y, w):
+    """Per-motor pin roles ("F"/"R") of one (x, y, w) direction blend."""
+    out = {}
+    for name in "ABCD":
+        sx, sy, sw = WHEEL_MIX[name]
+        out[name] = "F" if (x * sx + y * sy + w * sw) > 0 else "R"
+    return out
+
+
+# movement -> per-motor direction, derived from the vectors above so the two
+# can never drift apart (F = forward pin gets the duty, R = reverse pin)
+MOVE_PATTERNS = {code: mix_pattern(*vec) for code, vec in MOVE_VECTORS.items()}
 
 MOTOR_ROLES = ("rev", "fwd")
 MOTORS = {}                  # "A" -> {"rev": pwm or None, "fwd": pwm or None}
@@ -237,15 +264,33 @@ def set_duty(motor, up, duty):
         DUTY_TARGET[index] = duty
 
 
+def apply_mix(x, y, w, spd):
+    """Aim the wheels at a direction blend (ramped by service_motors).
+
+    x = forward/backward, y = strafe right/left, w = spin right/left, each in
+    -100..100.  Every wheel gets the signed sum of the three components, scaled
+    so the fastest wheel turns at `spd` duty: the per-wheel differential steers
+    the cart while it drives.
+    """
+    comp = {}
+    for name in "ABCD":
+        sx, sy, sw = WHEEL_MIX[name]
+        comp[name] = x * sx + y * sy + w * sw
+    peak = max([100] + [abs(v) for v in comp.values()])
+    for name in "ABCD":
+        duty = abs(comp[name]) * spd / peak
+        up = comp[name] > 0
+        set_duty(name, up, int(duty + 0.5))
+        set_duty(name, not up, 0)
+    return True
+
+
 def apply_move(code, spd):
     """Aim the wheels at one of the six movements (ramped by service_motors)."""
-    pat = MOVE_PATTERNS.get(code)
-    if not pat:
+    vec = MOVE_VECTORS.get(code)
+    if not vec:
         return False
-    for name in "ABCD":
-        up = (pat[name] == "F")
-        set_duty(name, up, spd)
-        set_duty(name, not up, 0)
+    apply_mix(vec[0], vec[1], vec[2], spd)
     return True
 
 
@@ -583,6 +628,25 @@ def handle_command(conn, line):
             send_line(conn, "E,unknown movement '%s'" % code)
             return
         move_dir = code
+        last_move_ms = _ticks_ms()
+
+    elif cmd == "mix" and len(args) >= 3:
+        # blend while driving: mix <fwd> <strafe-right> <spin-right> [speed]
+        if estop_latched:
+            send_line(conn, "E,estop is latched - send 'resume' first")
+            return
+        try:
+            x, y, w = [int(float(v)) for v in args[:3]]
+            spd = int(float(args[3])) if len(args) > 3 else speed
+        except Exception:
+            send_line(conn, "E,mix needs numbers: mix <fwd> <strafe> <spin> [speed]")
+            return
+        x = max(-100, min(100, x))
+        y = max(-100, min(100, y))
+        w = max(-100, min(100, w))
+        spd = max(0, min(100, spd))
+        apply_mix(x, y, w, spd)
+        move_dir = "mix %d %d %d" % (x, y, w)
         last_move_ms = _ticks_ms()
 
     elif cmd == "stop":
