@@ -189,13 +189,15 @@ check(cmd is not None and dt < 0.20, "tapped key stops within 200 ms (%.0f ms)"
       % ((dt or 9) * 1000))
 
 sent[:] = []
+t0 = time.time()
 press("w")
 settle(0.6)
 release("w")
 settle(0.3)
-moves = [c for _, c in sent if c.startswith("move f")]
-check(len(moves) >= 8, "held key re-sends ~every %d ms (%d sends in 0.6 s)"
-      % (rg.DRIVE_TICK_MS, len(moves)))
+moves = [c for ts, c in sent if c.startswith("move f")]
+check(len(moves) >= 3 and sent[-1][0] - t0 > 0.3,
+      "held key keeps driving (%d sends in 0.6 s, last at +%.2fs)"
+      % (len(moves), sent[-1][0] - t0))
 
 print()
 print("--- steering mixes from the keyboard ---")
@@ -204,20 +206,21 @@ press("w")
 settle(0.15)
 press("a")
 settle(0.15)
-check(any(c == "mix 100 -100 0 55" for _, c in sent),
-      "W+A -> forward-left diagonal (%r)" % [c for _, c in sent][-3:])
+check(any(c == "mix 100 0 -100 55" for _, c in sent),
+      "W+A steers left while driving (%r)" % [c for _, c in sent][-3:])
 release("a")
-settle(0.15)
+settle(0.25)
 check(any(c == "move f 55" for _, c in sent),
       "releasing A falls back to plain 'move f'")
-press("q")
-settle(0.15)
-check(any(c == "mix 100 0 -100 55" for _, c in sent),
-      "W+Q -> curve left while driving")
-release("q")
 release("w")
+settle(0.25)
+sent[:] = []
+press("a")
+settle(0.25)
+check(any(c == "move l 55" for _, c in sent),
+      "A alone (no forward vector) moves sideways")
+release("a")
 settle(0.3)
-check(sent[-1][1] == "stop", "all keys released -> 'stop'")
 
 print()
 print("--- gamepad discovery and axis layout ---")
@@ -228,10 +231,11 @@ lay = app.pad.layout or {}
 check(app.pad.name == NAME, "reader opened the virtual pad (%r)" % app.pad.name)
 check(app.pad.path == path, "device path %r" % app.pad.path)
 check(lay.get("lx") == ABS_X and lay.get("ly") == ABS_Y, "left stick = ABS_X/Y (%s)" % lay)
-check(lay.get("spin") == ABS_Z, "right stick (spin) = ABS_Z (%s)" % lay)
+check(lay.get("rstr") == ABS_Z and lay.get("rspin") == ABS_RZ,
+      "right stick = ABS_Z/ABS_RZ (%s)" % lay)
 check(lay.get("rt") == ABS_GAS and lay.get("lt") == ABS_BRAKE,
       "triggers = ABS_GAS/BRAKE (%s)" % lay)
-check("spin=ABS_Z" in log_text() and "RT" in log_text(),
+check("rstr=ABS_Z" in log_text() and "RT" in log_text(),
       "layout logged for the user")
 
 print()
@@ -263,21 +267,37 @@ sent[:] = []
 pad.stick(ABS_Y, -1.0)
 pad.stick(ABS_X, 1.0)
 settle(0.25)
-check(any(c == "mix 100 100 0 55" for _, c in sent),
-      "stick diagonal -> 'mix' diagonal (%r)" % sent[:2])
+check(any(c == "mix 100 0 100 55" for _, c in sent),
+      "stick pushed diagonally steers right while driving (%r)" % sent[:2])
 pad.stick(ABS_Y, 0.0)
 pad.stick(ABS_X, 0.0)
 settle(0.3)
 
 sent[:] = []
 pad.stick(ABS_Y, -1.0)
-pad.stick(ABS_Z, 1.0)                       # drive + spin = curve
+pad.stick(ABS_Z, 1.0)                       # forward + right stick sideways = crab
 settle(0.25)
-check(any(c == "mix 100 0 100 55" for _, c in sent),
-      "stick + right stick -> 'mix' curve (%r)" % sent[:2])
+check(any(c == "mix 100 100 0 55" for _, c in sent),
+      "right stick adds sideways while driving (%r)" % sent[:2])
 pad.stick(ABS_Y, 0.0)
 pad.stick(ABS_Z, 0.0)
 settle(0.3)
+
+sent[:] = []
+pad.stick(ABS_Z, 1.0)                       # right stick sideways on its own
+settle(0.2)
+check(any(c == "move r 55" for _, c in sent),
+      "right stick X alone -> sideways (%r)" % sent[:2])
+pad.stick(ABS_Z, 0.0)
+settle(0.25)
+
+sent[:] = []
+pad.stick(ABS_RZ, 1.0)                      # right stick Y = spin in place
+settle(0.2)
+check(any(c == "move tr 55" for _, c in sent),
+      "right stick Y alone -> spin in place (%r)" % sent[:2])
+pad.stick(ABS_RZ, 0.0)
+settle(0.25)
 
 print()
 print("--- gamepad: buttons, D-pad, triggers ---")

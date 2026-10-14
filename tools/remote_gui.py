@@ -64,13 +64,12 @@ MOVE_KEYS = {"w": "f", "up": "f", "s": "b", "down": "b",
              "q": "tl", "e": "tr"}
 MOVE_LABEL = {"f": "forward", "b": "backward", "l": "strafe left", "r": "strafe right",
               "tl": "spin left", "tr": "spin right"}
-# movement code -> (forward, strafe-right, spin-right) at full deflection.
-# Held inputs add up (W+A = forward-left diagonal, W+Q = left curve while
-# driving); the bot turns the blend into per-wheel duty differentials
-# ('mix' command in remote_bot.py).
-MOVE_VECTORS = {"f": (100, 0, 0), "b": (-100, 0, 0),
-                "l": (0, -100, 0), "r": (0, 100, 0),
-                "tl": (0, 0, -100), "tr": (0, 0, 100)}
+# movement code -> role and sign in the drive vector (see _move_vector):
+#   x = forward/backward, h = steer while driving / strafe when not,
+#   w = spin (always)
+MOVE_ROLES = {"f": ("x", +1), "b": ("x", -1),
+              "l": ("h", -1), "r": ("h", +1),
+              "tl": ("w", -1), "tr": ("w", +1)}
 SERVO_KEYS = {
     "r": ("big_arm", +1), "f": ("big_arm", -1),
     "t": ("little_arm", +1), "g": ("little_arm", -1),
@@ -84,6 +83,9 @@ SERVO_KEYS = {
 STALE_TELEMETRY_S = 1.5          # after this long without telemetry: "silent"
 DRIVE_TICK_MS = 60               # re-send the held input this often (the bot's
                                  # watchdog needs a 'move' every 600 ms)
+DRIVE_KEEPALIVE_S = 0.15         # ... but only re-send an *unchanged* command
+                                 # this often: the ESP32/WiFi link is the slow
+                                 # part, no need for 16 identical packets a second
 REPEAT_GAP_S = 0.15              # a release + auto-repeat press gap is shorter than this
 RELEASE_GAP_S = 0.10             # ... and for a key that never auto-repeated
 MAX_KEY_HOLD_S = 10.0            # safety: forget a key that sent no events for this long
@@ -113,6 +115,9 @@ PAD_ABS_Z, PAD_ABS_RZ = 0x02, 0x05         # right stick X / Y on some pads
 PAD_ABS_RX = 0x03                          # right stick X on most pads
 PAD_ABS_GAS, PAD_ABS_BRAKE = 0x09, 0x0a    # RT / LT (Stadia & friends)
 PAD_ABS_HAT0X, PAD_ABS_HAT0Y = 0x10, 0x11  # D-pad
+PAD_ABS_RY = 0x04                          # right stick Y on most pads
+PAD_AXIS_PAIR = {PAD_ABS_Z: PAD_ABS_RZ, PAD_ABS_RZ: PAD_ABS_Z,
+                 PAD_ABS_RX: PAD_ABS_RY, PAD_ABS_RY: PAD_ABS_RX}  # horiz <-> vert
 PAD_AXIS_NAMES = {PAD_ABS_X: "ABS_X", PAD_ABS_Y: "ABS_Y", PAD_ABS_Z: "ABS_Z",
                   PAD_ABS_RX: "ABS_RX", 0x04: "ABS_RY", PAD_ABS_RZ: "ABS_RZ",
                   PAD_ABS_GAS: "ABS_GAS(RT)", PAD_ABS_BRAKE: "ABS_BRAKE(LT)",
@@ -291,21 +296,23 @@ class Gamepad:
             return None
         if PAD_ABS_GAS in ranges or PAD_ABS_BRAKE in ranges:
             # dedicated trigger axes (Stadia, ...): Z/RZ are the right stick
-            spin = self.spin_axis if self.spin_axis is not None else pick(PAD_ABS_Z, PAD_ABS_RZ)
+            rstr = self.spin_axis if self.spin_axis is not None else pick(PAD_ABS_Z, PAD_ABS_RZ)
             lt, rt = pick(PAD_ABS_BRAKE), pick(PAD_ABS_GAS)
         else:
-            # xpad-style: Z/RZ are the triggers, RX is the right stick
-            spin = self.spin_axis if self.spin_axis is not None else pick(PAD_ABS_RX)
+            # xpad-style: Z/RZ are the triggers, RX/RY the right stick
+            rstr = self.spin_axis if self.spin_axis is not None else pick(PAD_ABS_RX)
             lt, rt = pick(PAD_ABS_Z), pick(PAD_ABS_RZ)
-        if spin is not None:             # one axis, one job
-            if lt == spin:
-                lt = None
-            if rt == spin:
-                rt = None
+        rspin = PAD_AXIS_PAIR.get(rstr)      # the right stick's vertical axis
+        if rspin is not None and rspin not in ranges:
+            rspin = None
+        if lt is not None and lt in (rstr, rspin):
+            lt = None                        # one axis, one job
+        if rt is not None and rt in (rstr, rspin):
+            rt = None
         if lt is not None and lt == rt:
             rt = None
         return {"lx": pick(PAD_ABS_X), "ly": pick(PAD_ABS_Y),
-                "spin": spin, "lt": lt, "rt": rt}
+                "rstr": rstr, "rspin": rspin, "lt": lt, "rt": rt}
 
     def _layout_text(self):
         lay = self.layout or {}
@@ -590,6 +597,11 @@ class App:
                            PAD_SPIN_CHOICES.get(self.pad_spin) if self.pad_spin else None)
         self._stick_engaged = set()          # pad axes currently past the deadzone
         self._pad_repeat = {}                # held pad action -> last run time
+        self._last_drive = None              # last 'move'/'mix' text sent
+        self._last_drive_at = 0.0
+        self._pad_log_at = {}                # pad axis code -> last logged
+        self._lan_ip = upload_bot.lan_ip() if upload_bot else "?"
+        self._lan_ip_at = time.time()
 
         root.title("Maixduino cart remote control")
         root.minsize(880, 620)
@@ -810,15 +822,15 @@ class App:
                            ("cmd", "#444444"), ("info", "#333333")):
             self.logbox.tag_configure(tag, foreground=color)
 
-        help_txt = ("W/S fwd/back   A/D strafe   Q/E spin   Space stop   Esc e-stop   "
-                    "R/F big arm   T/G little arm   Y/H rotate   C/V grab/release   "
-                    "1-8 as above   P home   +/- speed   [ ] step   |   combine them to "
-                    "steer while driving (W+A = diagonal, W+Q = curve); mouse: use the "
+        help_txt = ("W/S fwd/back   A/D steer when driving / strafe when stopped   "
+                    "Q/E spin   Space stop   Esc e-stop   R/F big arm   T/G little arm   "
+                    "Y/H rotate   C/V grab/release   1-8 as above   P home (arm only, the "
+                    "clamp keeps its grip)   +/- speed   [ ] step   |   mouse: use the "
                     "drive pad / +/- buttons (keys need the window focused, click once)"
-                    "\ngamepad (USB or Bluetooth): L-stick drive/steer   R-stick spin   "
-                    "A/B clamp grab/release   X home   Y stop   Start e-stop/resume   "
-                    "LB/RB little arm   D-pad big arm + rotation   LT/RT speed   "
-                    "(analog, works even when the window is not focused)")
+                    "\ngamepad: L-stick drive + steer (strafe when stopped)   "
+                    "R-stick sideways / spin in place   A/B clamp grab/release   X home   "
+                    "Y stop   Start e-stop/resume   LB/RB little arm   D-pad big arm + "
+                    "rotation   LT/RT speed   (analog, works even when the window is not focused)")
         tk.Label(root, text=help_txt, anchor="w", justify="left", fg="#333333").pack(
             fill="x", padx=8, pady=(0, 6))
 
@@ -884,8 +896,7 @@ class App:
             self.log("listening on %s" % self._listen_text(), "ok")
 
     def _listen_text(self):
-        ip = upload_bot.lan_ip() if upload_bot else "?"
-        return "%s:%s" % (ip, self.port.get())
+        return "%s:%s" % (self._lan_ip, self.port.get())
 
     # ------------------------------------------------------------ upload ---
     def _upload_clicked(self):
@@ -1028,6 +1039,7 @@ class App:
                 self.link.send("motor %s stop" % self._wheel[0])
                 self._wheel = None
             self._moving = False
+            self._last_drive = None
             self.link.send("stop")
 
     def _key_is_down(self, k, now):
@@ -1080,6 +1092,7 @@ class App:
         self._pad_down.clear()
         self._pad_time.clear()
         self._moving = False
+        self._last_drive = None
         if self._wheel is not None:
             self._send("motor %s stop" % self._wheel[0])
             self._wheel = None
@@ -1088,34 +1101,45 @@ class App:
     def _move_vector(self, now):
         """(x, y, w) drive vector: held keys/buttons plus the gamepad sticks.
 
-        x = forward, y = strafe right, w = spin right, each -100..100.  Several
-        inputs add up, so W+A is the forward-left diagonal and W+Q is a left
-        curve while driving - the bot turns the blend into per-wheel duty
-        differentials ('mix' command).
+        x = forward, y = strafe right, w = spin right, each -100..100.
+
+        Horizontal input (A/D, ←/→, mouse pad, left stick X) *steers* while the
+        cart is driving and *strafes* when it is not - so W+A is a left curve
+        rather than a diagonal, and A alone moves sideways.  The right stick
+        gives sideways (X) and spin-in-place (Y) at any time; Q/E always spin.
+        Several inputs add up.
         """
-        x = y = w = 0.0
+        x = h = y_only = w_only = 0.0
         for k in list(self._key_press):
             code = MOVE_KEYS.get(k)
             if code and self._key_is_down(k, now):
-                vx, vy, vw = MOVE_VECTORS[code]
-                x += vx
-                y += vy
-                w += vw
+                role, sign = MOVE_ROLES[code]
+                if role == "x":
+                    x += sign * 100
+                elif role == "h":
+                    h += sign * 100
+                else:
+                    w_only += sign * 100
             elif code:
                 del self._key_press[k]
                 self._key_release.pop(k, None)
                 self._key_repeat.discard(k)
         for code in list(self._pad_down):
-            vx, vy, vw = MOVE_VECTORS[code]
-            x += vx
-            y += vy
-            w += vw
+            role, sign = MOVE_ROLES[code]
+            if role == "x":
+                x += sign * 100
+            elif role == "h":
+                h += sign * 100
+            else:
+                w_only += sign * 100
         lay = self.pad.layout
         if lay:
-            x -= self._stick_axis(lay["ly"]) * 100      # stick up = forward
-            y += self._stick_axis(lay["lx"]) * 100      # stick right = strafe right
-            w += self._stick_axis(lay["spin"]) * 100    # right stick right = spin right
-        return x, y, w
+            x -= self._stick_axis(lay["ly"]) * 100          # stick up = forward
+            h += self._stick_axis(lay["lx"]) * 100          # steer / strafe
+            y_only += self._stick_axis(lay["rstr"]) * 100   # right stick = sideways
+            w_only += self._stick_axis(lay["rspin"]) * 100  # ... and spin in place
+        weight = min(1.0, abs(x) / 100.0)                   # driving? then steer
+        return x, h * (1.0 - weight) + y_only, h * weight + w_only
 
     # -------------------------------------------------- gamepad mapping ---
     def _stick_axis(self, axis):
@@ -1181,6 +1205,10 @@ class App:
             return
         if self.log_keys.get():
             if kind == "axis":
+                now = time.time()                       # throttle: a moving stick
+                if now - self._pad_log_at.get(code, 0.0) < 0.25:   # would flood the
+                    return                                          # log and the Tk loop
+                self._pad_log_at[code] = now
                 name = PAD_AXIS_NAMES.get(code, "axis %d" % code)
             else:
                 name = PAD_BTN_NAMES.get(code, "button %d" % code)
@@ -1227,25 +1255,36 @@ class App:
                 self._send_drive(x, y, w, speed)
                 self._moving = True
         elif self._moving:
+            self._last_drive = None              # next drive command goes out at once
             self._send("stop")
             self._moving = False
 
     def _send_drive(self, x, y, w, speed):
         """One drive step: 'move' for a single component (older bots understand
-        it too), 'mix' when several inputs blend - steering on the fly."""
+        it too), 'mix' when several inputs blend - steering on the fly.
+
+        The command is only re-sent when it changes (or after KEEPALIVE_S, well
+        inside the bot's 600 ms watchdog): a steady input would otherwise push
+        16 identical packets a second through the slow ESP32/WiFi link.
+        """
         x, y, w = int(round(x)), int(round(y)), int(round(w))
         if len([c for c in (x, y, w) if c]) == 1:
             axis = 0 if x else (1 if y else 2)      # exactly one input: plain move
             value = (x, y, w)[axis]
             code = {0: ("b", "f"), 1: ("l", "r"), 2: ("tl", "tr")}[axis][value > 0]
             spd = max(1, int(round(abs(value) * speed / 100.0)))
-            if not self._moving:
-                self.log("-> move %s @ %d" % (MOVE_LABEL[code], spd))
-            self.link.send("move %s %d" % (code, spd))
+            cmd = "move %s %d" % (code, spd)
+            label = "-> move %s @ %d" % (MOVE_LABEL[code], spd)
         else:
-            if not self._moving:
-                self.log("-> mix fwd=%d strafe=%d spin=%d @ %d" % (x, y, w, speed))
-            self.link.send("mix %d %d %d %d" % (x, y, w, speed))
+            cmd = "mix %d %d %d %d" % (x, y, w, speed)
+            label = "-> mix fwd=%d strafe=%d spin=%d @ %d" % (x, y, w, speed)
+        now = time.time()
+        if cmd == self._last_drive and now - self._last_drive_at < DRIVE_KEEPALIVE_S:
+            return
+        if cmd != self._last_drive and not self._moving:
+            self.log(label)
+        self._last_drive, self._last_drive_at = cmd, now
+        self.link.send(cmd)
 
     def _drive_tick(self):
         """Keep the input->cart path alive while a key/button is held."""
@@ -1384,6 +1423,9 @@ class App:
 
     def _status_tick(self):
         now = time.time()
+        if upload_bot is not None and now - self._lan_ip_at > 10.0:
+            self._lan_ip_at = now                # refresh rarely: lan_ip() spawns
+            self._lan_ip = upload_bot.lan_ip()   # 'ip addr' (too slow for 4 Hz)
         if self.link.connected:
             if now - self._last_tel < STALE_TELEMETRY_S:
                 state, color = "bot connected - telemetry live", "#1b5e20"

@@ -32,7 +32,7 @@ in RAM, see *Why RAM?* below), so press it again after every reset or power-up.
 | Keys | Action |
 |------|--------|
 | `W`/`S` or `↑`/`↓` | forward / backward |
-| `A`/`D` or `←`/`→` | strafe left / right (mecanum) |
+| `A`/`D` or `←`/`→` | steer left / right while driving, strafe when stopped |
 | `Q` / `E` | spin left / right |
 | `Space` | stop the wheels |
 | `Esc` | **E-STOP** (latched: wheels stop, servos go loose; press again to resume) |
@@ -41,7 +41,7 @@ in RAM, see *Why RAM?* below), so press it again after every reset or power-up.
 | `Y` / `H` | arm rotation left / right |
 | `C` / `V` | clamp: grab / release |
 | `1`…`8` | same as above: 1 big arm down, 2 up, 3 little down, 4 up, 5 rotate left, 6 rotate right, 7 release, 8 grab |
-| `P` | home pose (`SERVO_HOME`) |
+| `P` | home pose: `big_arm`/`little_arm`/`rotation` to `SERVO_HOME` (the clamp keeps its grip - release it explicitly with `C`/`V`) |
 | `+` / `-` | drive speed |
 | `[` / `]` | servo step size |
 
@@ -49,12 +49,15 @@ Keyboard input stops driving while you are typing in a text field (the status
 line tells you); click the window background to drive again.  Movement keeps
 being sent while a key is held; when you let go, the wheels stop.
 
-**Steering while driving / 边走边转向:** held directions *combine* instead of
-replacing each other, so `W`+`A` is the forward-left diagonal and `W`+`Q`
-drives forward while spinning left (a curve).  The GUI sends the blend to the
-bot, which gives every wheel its own duty - the mecanum "RPM differential"
-(`mix` in the protocol table below).  Two opposite keys cancel out; releasing
-one key falls back to the remaining one.
+**Steering while driving / 边走边转向:** held directions *combine*.  While the
+cart is driving, the horizontal input (`A`/`D`, `←`/`→`, the left stick's X
+axis) **steers** - `W`+`A` is a left curve, not a diagonal - and when there is
+no forward/backward component the very same input moves the cart **sideways**
+instead, so `A` alone strafes.  `Q`/`E`, the right stick's sideways and spin
+axes (below) and the mouse pad's spin buttons stay available while driving.  The
+GUI sends the blend to the bot, which gives every wheel its own duty - the
+mecanum "RPM differential" (`mix` in the protocol table below).  Opposite inputs
+cancel out; releasing one falls back to the rest.
 
 ### How the steering mix works / 混合驱动原理
 
@@ -74,6 +77,11 @@ proportionally), so blending never exceeds the speed you set - the *difference*
 between the wheels is what curves the cart.  `move f`/`l`/`tl`/… is the same
 maths with a single component; the full table and the offline test are in
 `tools/test_bot_mixing.py`.
+
+Which components the inputs produce: driving + horizontal input = `w`
+(**steering**), horizontal input with no forward/backward = `y` (**sideways**),
+the right stick's X axis = `y`, its Y axis = `w`, and `Q`/`E` = `w`.  A grabbed
+object keeps its grip while all of this happens.
 
 **Keyboard focus (Wayland / XWayland):** Tk 8.6 has no Wayland backend, so this
 window runs through X11 compatibility (XWayland) and only receives keys while it
@@ -97,13 +105,32 @@ the mouse too - so the cart can be driven without any keyboard input.
 **Auto-brake** (on by default): while driving *forward*, the GUI stops sending
 motion if the ultrasonic distance is below the threshold (15 cm default).
 
-Response time: a press is sent to the cart **immediately** (no tick wait), the
-input is re-sent every 60 ms while held (the bot's watchdog needs one every
-600 ms), and a release stops the wheels within ~100 ms.  The wheels themselves
-ramp up/down softly (`MOTOR_RAMP_DUTY_PER_TICK` in `remote_bot.py`, default 6
-duty units per 20 ms loop tick ≈ 180 ms from 0 to 55): raise it (e.g. 12) if
-the cart feels sluggish to start, but watch the shared 5 V rail - the servos
-and the ESP32 brown out if the motors draw current too abruptly.
+**Latency / 延迟:** a press is sent to the cart **immediately** (no tick wait),
+an *unchanged* command is re-sent every 150 ms (the bot's watchdog needs one
+every 600 ms) and a release stops the wheels within ~100 ms.  The cart side then
+adds up to one loop iteration (`LOOP_TICK_MS = 10` in `remote_bot.py`) to read
+the command, plus the soft-start ramp (`MOTOR_RAMP_DUTY_PER_TICK`, 6 duty units
+per 10 ms tick ≈ 90 ms to full speed); raise the ramp constant if the cart feels
+sluggish, but watch the shared 5 V rail - the servos and the ESP32 brown out if
+the motors draw current too abruptly.
+
+Measured on this cart (phone hotspot, ESP32/WiFi): ping round-trips from 20 ms
+up to 500 ms and a plain command took ~600 ms, while telemetry ran at 2.8 Hz
+instead of 5.  The bot's old loop was the main cost (a 20 ms blocking `recv` +
+20 ms sleep + two blocking ESP32 SPI reads per telemetry ≈ 70 ms per
+iteration); it now polls every 10 ms with a 5 ms recv timeout, pings the sonar
+and reads the tracker ADC on every other telemetry cycle, and the GUI only
+sends a command when it changes.
+
+The **laptop's WiFi power saving** can add 100-300 ms on its own - check it and
+turn it off if it is on (then reconnect):
+
+    iw dev wlp3s0 get power_save                       # on/off
+    nmcli con mod "<your wifi>" 802-11-wireless.powersave 2
+    nmcli con up "<your wifi>"
+
+The GUI's status line shows the live ping RTT (`RTT 34 ms`), so the effect is
+easy to watch.
 
 ## Gamepad / 手柄 (USB or Bluetooth)
 
@@ -117,8 +144,9 @@ GUI picked for what (handy when a pad wires things unusually).
 
 | Controller | Action |
 |------------|--------|
-| left stick | **analog drive**: forward/backward + strafe at once (push it diagonally to steer while driving) |
-| right stick X | **analog spin** left / right (adds to the drive vector = curve while moving) |
+| left stick | **analog drive + steer**: up/down drives, left/right steers while driving and strafes when stopped |
+| right stick X | **analog sideways** (works while driving too - crabbing) |
+| right stick Y | **analog spin in place** |
 | `A` / `B` | clamp grab / release |
 | `X` | home pose (`SERVO_HOME`) |
 | `Y` | stop the wheels (like `Space`) |
@@ -201,7 +229,7 @@ One command per line, from the GUI to the bot:
 | `srv <name> <deg>` | servo to an absolute angle (`big_arm`, `little_arm`, `rotation`, `clamp`, 1…4) |
 | `nudge <name> <delta>` | move a servo by a relative angle |
 | `grab` / `release` | clamp to `GRAB_DEG` / `OPEN_DEG` |
-| `home` | all servos to `SERVO_HOME` |
+| `home` | arm servos to `SERVO_HOME` (the clamp keeps its grip) |
 | `estop` / `resume` | latch / clear the emergency stop |
 | `speed <0-100>` | default drive speed |
 | `motor <A-D> <f\|r\|stop> [speed]` | drive ONE wheel only (wiring/polarity test; same watchdog as `move`) |
@@ -272,9 +300,7 @@ rail - rail sag / motor noise makes servos buzz and can brown out the WiFi):
   command is active (no servo noise, no rail load from the servos), but a
   grabbed object is dropped when you drive.
 
-### Testing wheels and servos one at a time
-
-The **Drive (mouse)** panel has "one wheel:" rows: `A`-`D` each with a
+### Testing wheels and servos one at a timeThe **Drive (mouse)** panel has "one wheel:" rows: `A`-`D` each with a
 `◀`/`▶` button - press and hold one to run just that wheel (it also stops any
 other movement).  Watch each wheel: with the mirrored wiring fixed in software,
 `▶` should always be the direction that moves the cart forward, `◀` backward
@@ -314,6 +340,16 @@ restore a clean filesystem — the bot works fine without that.
   Channel `c4` is not wired on this tracker (reads 0) and is displayed anyway.
 * **A servo does nothing** — wrong pin in `SERVO_PINS`.  Use `ide/servo_hold_ide.py`
   or `servo_test.py` to find which pin moves which joint, then update the map.
+* **The clamp lets go while driving / while the arm moves** — it can only open
+  if a command says so (`release`, `B`/`V`/`7`, a clamp nudge - or the old
+  "home opens everything", which is fixed: `home` now leaves the clamp alone) or
+  if the servo itself loses power.  The two look identical from outside, so
+  watch the GUI's clamp bar: if the shown angle *animates* to −35 when it drops,
+  a command arrived (the bot logs every grab/release/nudge - check the log); if
+  the shown angle stays at the grab value, the servo lost power.  That is
+  **rail sag** (idle clamp holds, adding any load drops it): charge/replace the
+  battery, add a 1000 µF+ electrolytic capacitor across the servo 5 V rail (or
+  a separate 5 V UBEC for the servos), and keep the motor ramp soft.
 * **The controller does nothing** — check the third status line and
   `ls -l /dev/input/js*`.  Nothing there: the pad is not connected/pair
   finished yet, or the `joydev` module is missing.  A pad that *is* listed but

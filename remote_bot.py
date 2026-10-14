@@ -86,12 +86,16 @@ SERVER_PORT = 6000
 SPEED = 55              # default drive speed, motor duty 0-100
 WATCHDOG_MS = 600       # motors stop if no 'move' command for this long
 LINK_TIMEOUT_MS = 6000  # reconnect if nothing arrives from the GUI for this long
-LOOP_TICK_MS = 20       # main loop period (~50 Hz)
+LOOP_TICK_MS = 10       # main loop period (~100 Hz): incoming commands are only
+                        # read once per iteration, so a short period keeps the
+                        # control delay down (20 ms loop + blocking recv + the
+                        # ESP32 SPI work added up to ~70 ms per iteration)
 TELEMETRY_MS = 200      # how often a telemetry line is sent (~5 Hz)
 MOTOR_RAMP_DUTY_PER_TICK = 6   # soft start/stop: duty units added per loop tick
                                # (0 = switch instantly; bigger = quicker; a ramp
                                #  keeps the current spikes / rail sag / motor noise
-                               #  away from the servos and the ESP32)
+                               #  away from the servos and the ESP32 - 6 per 10 ms
+                               #  tick reaches full duty in ~90 ms)
 RELEASE_SERVOS_WHILE_DRIVING = False   # True: arm goes limp while the wheels run
                                # (helps if the servos buzz or brown out while
                                #  driving - but a grabbed object would be dropped)
@@ -108,6 +112,10 @@ SERVO_LIMITS = {
 }
 # pose taken at startup and with the 'home' command
 SERVO_HOME = {"big_arm": 0, "little_arm": 0, "rotation": 0, "clamp": -35}
+# 'home' re-poses the arm only: the clamp keeps whatever it holds, otherwise an
+# accidental P / gamepad-X would drop a grabbed object (release it explicitly
+# with 'release' / C / B when you want the clamp open).
+ARM_SERVOS = ("big_arm", "little_arm", "rotation")
 GRAB_DEG = 40           # clamp: fingers closed around an object (vendor demo used ~35)
 OPEN_DEG = -35          # clamp: fully open
 
@@ -387,12 +395,17 @@ def service_servos():
         s["pwm"].duty(duty_for(nxt))
 
 
-def release_servos():
-    """Cut the servo signals - the arm goes loose (no holding force)."""
+def release_servos(keep=()):
+    """Cut the servo signals - the arm goes loose (no holding force).
+
+    `keep` names servos that stay energised: the clamp keeps gripping while the
+    wheels run (dropping a grabbed object costs more than the saved current).
+    """
     global servos_released
     servos_released = True
     for name in SERVO_ORDER:
-        SERVO[name]["pwm"].duty(0)
+        if name not in keep:
+            SERVO[name]["pwm"].duty(0)
 
 
 def hold_servos():
@@ -563,7 +576,11 @@ def tcp_connect():
         pass
     s.connect((SERVER_HOST, SERVER_PORT))
     try:
-        s.settimeout(0.02)      # short recv timeout: keep polling/telemetry flowing
+        s.settimeout(0.005)     # very short recv timeout: reading the socket must
+    except Exception:           # not block the loop (commands wait for it)
+        pass
+    try:
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)   # no Nagle delay
     except Exception:
         pass
     return s
@@ -701,6 +718,8 @@ def handle_command(conn, line):
         else:
             try:
                 servo_nudge(name, float(args[1]))
+                if name == "clamp":            # keep clamp moves visible in the log
+                    send_line(conn, "L,clamp nudge -> %d deg" % (SERVO["clamp"]["target10"] // 10))
             except Exception:
                 send_line(conn, "E,bad delta '%s'" % args[1])
 
@@ -708,14 +727,17 @@ def handle_command(conn, line):
         if estop_latched:
             send_line(conn, "E,estop is latched - send 'resume' first")
         else:
-            servo_target("clamp", GRAB_DEG if cmd == "grab" else OPEN_DEG)
+            deg = GRAB_DEG if cmd == "grab" else OPEN_DEG
+            servo_target("clamp", deg)
+            send_line(conn, "L,clamp %s (%d deg)" % (cmd, deg))
 
     elif cmd == "home":
         if estop_latched:
             send_line(conn, "E,estop is latched - send 'resume' first")
         else:
-            for name in SERVO_ORDER:
+            for name in ARM_SERVOS:            # the clamp keeps its grip
                 servo_target(name, SERVO_HOME.get(name, 0))
+            send_line(conn, "L,home pose (clamp keeps its grip)")
 
     elif cmd == "estop":
         estop_latched = True
@@ -762,6 +784,10 @@ def serve(conn, sonar):
     last_wifi_check = now
     last_move_ms = now
     last_rx_ms = now
+    last_dist = -1
+    sonar_turn = False
+    adc_turn = False
+    last_adc = None
     empty_recvs = 0
     recv_errs = 0
 
@@ -825,8 +851,8 @@ def serve(conn, sonar):
         # ---- optional: let the arm go loose while the wheels are running ----
         if RELEASE_SERVOS_WHILE_DRIVING and not estop_latched:
             if move_dir is not None and not servos_released:
-                release_servos()
-                print("remote_bot: driving - servos released")
+                release_servos(keep=("clamp",))    # the clamp keeps gripping
+                print("remote_bot: driving - arm released, clamp holding")
             elif move_dir is None and servos_released:
                 hold_servos()
                 print("remote_bot: stopped - servos holding again")
@@ -839,22 +865,33 @@ def serve(conn, sonar):
         if _ticks_diff(now, last_telemetry) >= TELEMETRY_MS:
             last_telemetry = now
             flags = 0                              # bit0 estop, bit1 sonar, bit2 tracker, bit3 wifi
-            dist = -1
+            dist = last_dist
             if sonar.trig is not None:
                 flags |= 2                         # ultrasonic sensor detected
-                d = sonar.ping()
-                if d is not None:
-                    dist = int(d)
+                sonar_turn = not sonar_turn
+                if sonar_turn:                     # ping every other cycle: a
+                    d = sonar.ping()               # missing echo blocks the loop
+                    if d is not None:              # for up to 40 ms, which would
+                        last_dist = dist = int(d)  # delay incoming commands
             adc = (-1, -1, -1, -1, -1)
             onmask = 0
-            try:
-                adc = NIC.adc((0, 1, 2, 3, 4))
-                flags |= 4
+            adc_turn = not adc_turn
+            if not adc_turn and last_adc is not None:
+                adc = last_adc                       # reuse: the SPI read blocks
+                flags |= 4                           # the loop like the sonar ping
                 for ch in range(4):
                     if adc[ch] < tracker_thresh:
                         onmask |= (1 << ch)
-            except Exception:
-                pass
+            else:
+                try:
+                    adc = NIC.adc((0, 1, 2, 3, 4))
+                    last_adc = adc
+                    flags |= 4
+                    for ch in range(4):
+                        if adc[ch] < tracker_thresh:
+                            onmask |= (1 << ch)
+                except Exception:
+                    pass
             if estop_latched:
                 flags |= 1
             if NIC.isconnected():

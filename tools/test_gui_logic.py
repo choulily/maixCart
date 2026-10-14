@@ -83,7 +83,7 @@ app._pad_press("stop")                 # stop driving before checking
 settle(0.3)
 moves = [c for c in sent if c == "move f 55"]
 check(n_after_press >= 2, "key press drives (%d moves before repeats)" % n_after_press)
-check(len(moves) >= n_after_press + 2, "held key keeps driving through repeats (%d)" % len(moves))
+check(len(moves) >= n_after_press + 1, "held key keeps driving through repeats (%d)" % len(moves))
 check(not any(c == "stop" for c in moves), "no 'stop' during the auto-repeat stream")
 
 # ---- keyboard: release really stops ------------------------------------------
@@ -133,25 +133,38 @@ app._wheel_release("A")
 settle(0.2)
 check(any(c == "motor A r 55" for c in sent), "reverse wheel button sends 'motor A r'")
 
-# ---- steering: two directions blend into a 'mix' -----------------------------
+# ---- steering: horizontal input steers while driving, strafes when stopped ----
 sent[:] = []
 press("w")
 settle(0.15)
 press("a")
 settle(0.15)
-check(any(c == "mix 100 -100 0 55" for c in sent),
-      "W+A blends into a forward-left 'mix' (%r)" % sent[-3:])
+check(any(c == "mix 100 0 -100 55" for c in sent),
+      "W+A steers left while driving (%r)" % sent[-3:])
 release("a")
-settle(0.20)
+settle(0.25)
 check(any(c == "move f 55" for c in sent), "releasing A falls back to 'move f'")
 press("q")
 settle(0.15)
-check(any(c == "mix 100 0 -100 55" for c in sent), "W+Q blends into a left curve")
+check(any(c == "mix 100 0 -100 55" for c in sent), "W+Q steers left too (spin)")
 release("q")
+release("w")
+settle(0.3)
+
+sent[:] = []
+press("a")
+settle(0.25)
+check(any(c == "move l 55" for c in sent),
+      "A alone moves sideways, no forward vector (%r)" % sent[:2])
+release("a")
+settle(0.25)
+
+sent[:] = []
+press("w")
+settle(0.15)
 press("s")
 settle(0.15)
-check(any(c == "stop" in c or c == "stop" for c in sent),
-      "W+S cancels out -> 'stop'")
+check(any(c == "stop" for c in sent), "W+S cancels out -> 'stop'")
 release("s")
 release("w")
 settle(0.3)
