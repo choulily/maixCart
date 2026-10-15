@@ -134,7 +134,12 @@ FOLLOW_MIX_Y = 0.6      # 60% of the correction strafes sideways ...
 FOLLOW_MIX_W = 0.4      # ... 40% spins, so the cart also turns into the line
 FOLLOW_LOST_MS = 400    # line gone: keep the last command this long, then stop
 FOLLOW_PERIOD_MS = 20   # control cycle (as fast as the SPI read allows)
-FOLLOW_FLIP = False     # True if channel 0 is the cart's *right* sensor
+FOLLOW_ORDER = (0, 2, 3, 1)  # slot (cart left -> right) of each tracker channel:
+                        # measured on this cart, the sensor row reads
+                        # c0, c3, c1, c2 - i.e. channel i sits in slot
+                        # FOLLOW_ORDER[i] (0 = leftmost, 3 = rightmost)
+FOLLOW_FLIP = False     # True mirrors the row (3-slot): use it if the tracker
+                        # is ever remounted the other way round
                         # (the GUI's "mirror sensors" checkbox sends this)
 SERVO_STEP_DEG = 2.5    # servo easing speed, degrees per loop tick (~125 deg/s)
 TRACKER_THRESH = 2000   # tracker ADC reading below this = "on the line"
@@ -462,8 +467,10 @@ def line_error(adc):
     black it is.  That keeps working when a wide line covers the whole row (all
     dark = centred, error 0) and when only the edge sensor is on the line.
     Returns (error, seen): + means the line is to the cart's right, seen == 0
-    means the line is not under the sensor at all.  FOLLOW_FLIP swaps the sides
-    when the tracker is mounted (or wired) the other way round.
+    means the line is not under the sensor at all.  The channels are not wired
+    in physical order - FOLLOW_ORDER maps each one to its place in the row
+    (measured on this cart: c0, c3, c1, c2 from left to right) - and
+    FOLLOW_FLIP mirrors that row if the tracker is remounted.
     """
     total = 0.0
     acc = 0.0
@@ -474,7 +481,9 @@ def line_error(adc):
             continue
         if w > tracker_thresh:
             w = tracker_thresh
-        idx = (3 - ch) if FOLLOW_FLIP else ch
+        idx = FOLLOW_ORDER[ch]
+        if FOLLOW_FLIP:
+            idx = 3 - idx
         acc += idx * w
         total += w
         seen += 1

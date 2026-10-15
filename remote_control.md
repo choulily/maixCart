@@ -296,16 +296,23 @@ the WiFi round trip (~20-500 ms), which is far too slow to stay on a line.
 
 How it steers: each channel that sees black pulls the line estimate its way,
 weighted by how black it is, giving an offset in "channel units" (-1.5 = the
-line is under the leftmost sensor, 0 = centred, +1.5 = rightmost).  A PD term
-turns that offset into a strafe/spin blend (`FOLLOW_MIX_Y` / `FOLLOW_MIX_W`), so
-the cart crabs back onto the line and also turns into it.  A wide 5 cm strip
-covering the whole sensor row reads as "centred", which is correct; the useful
-error band is where the outer sensors start leaving the strip.
+line is under the leftmost sensor, 0 = centred, +1.5 = rightmost).  The channels
+of this cart's tracker are **not** wired in physical order - measured with the
+cart, the row reads **c0, c3, c1, c2 from the cart's left to its right**, and
+`FOLLOW_ORDER` (0, 2, 3, 1) maps them to their place, so the GUI's tracker panel
+shows the rows in that same physical order (cart left on top) and its
+"left/centre/right" text means the real thing.  A PD term turns the offset into
+a strafe/spin blend (`FOLLOW_MIX_Y` / `FOLLOW_MIX_W`), so the cart crabs back
+onto the line and also turns into it.  A wide 5 cm strip covering the whole
+sensor row reads as "centred", which is correct; the useful error band is where
+the outer sensors start leaving the strip.
 
 * **Start**: put the cart on the strip, sensor row over the line, then press
   **Follow line** (`follow 1 [speed] [flip]`).  The bot refuses to start if no
   channel sees the line - that is deliberate, so a stray click cannot send the
-  cart driving off.
+  cart driving off.  `flip` = 1 (GUI: **mirror sensors**) mirrors the row left
+  to right; this cart's order is already baked in, so that is only for a
+  remount/rewire.
 * **Stop**: the same button (`follow 0`), any manual drive input (pad/keyboard/
   gamepad - it takes the wheels back), `stop`, or E-STOP.  Any stop, the
   watchdog or the fast brake also ends following.
@@ -337,11 +344,10 @@ under the middle of the sensor row, and the run ends when the tape does.
 1. Upload the bot, restart the GUI, put the cart on the white board with the
    sensor row over the black strip, in the middle of the track pointing along it.
 2. Check the tracker panel: the channels over the strip must show ~850 and go
-   red/ON (idle white ≈ 4095).  This also tells you the sensor order: slide the
-   cart sideways so the strip is under the **left** half of the sensor row and
-   note which channel lights up (`c0` = left as shipped).  If the panel's
-   "left/right" text disagrees with reality, tick **mirror sensors** (that is
-   `FOLLOW_FLIP`, and it can be changed while running).
+   red/ON (idle white ≈ 4095).  The rows are shown in physical order with the
+   cart's left at the top, and this cart's row reads `c0, c3, c1, c2` from left
+   to right (measured) - the bot uses the same mapping, so the panel's
+   "left/centre/right" text is the real thing.
    Worth writing down for the tuning: the `c0…c3` numbers with the sensor over
    (a) the black strip, (b) the white board, (c) the floor - the floor matters,
    because if it reads below the threshold the cart will think a strip is there
@@ -392,7 +398,9 @@ All in the `config` block at the top of `remote_bot.py`:
 * `TRACKER_THRESH` (2000), `WATCHDOG_MS` (600), `TELEMETRY_MS` (200).
 * line following: `FOLLOW_SPEED` (45), `FOLLOW_KP` (30), `FOLLOW_KD` (45),
   `FOLLOW_MIX_Y`/`FOLLOW_MIX_W` (0.6/0.4), `FOLLOW_MIN_W` (160),
-  `FOLLOW_LOST_MS` (400), `FOLLOW_PERIOD_MS` (20), `FOLLOW_FLIP` (False).
+  `FOLLOW_LOST_MS` (400), `FOLLOW_PERIOD_MS` (20),
+  `FOLLOW_ORDER` (0, 2, 3, 1 = the channels' places in the row; this cart reads
+  c0, c3, c1, c2 from left to right), `FOLLOW_FLIP` (False).
 
 ### Wheel polarity / 轮子方向 (this cart is mirrored)
 

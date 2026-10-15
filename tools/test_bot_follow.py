@@ -177,17 +177,23 @@ def reset():
 # ------------------------------------------------------- line_error() ----
 print("--- line_error(): where is the line under the sensor row? ---")
 check(ns["line_error"](row())[1] == 0, "white row -> nothing seen")
-e, n = ns["line_error"](row(1, 2))
-check(abs(e) < 1e-9 and n == 2, "middle channels -> centred (%+.2f, %d)" % (e, n))
+# the row reads c0, c3, c1, c2 from the cart's left to its right (measured on
+# the cart), so the slots are c0=0, c3=1, c1=2, c2=3 - the tests pin that down
 e, n = ns["line_error"](row(0))
-check(abs(e + 1.5) < 1e-9, "line under channel 0 -> far left (%+.2f)" % e)
+check(abs(e + 1.5) < 1e-9, "against-sample: leftmost channel c0 -> -1.50 (%+.2f)" % e)
+e, n = ns["line_error"](row(2))
+check(abs(e - 1.5) < 1e-9, "against-sample: rightmost channel c2 -> +1.50 (%+.2f)" % e)
 e, n = ns["line_error"](row(3))
-check(abs(e - 1.5) < 1e-9, "line under channel 3 -> far right (%+.2f)" % e)
+check(abs(e + 0.5) < 1e-9, "second from left is c3 -> -0.50 (%+.2f)" % e)
+e, n = ns["line_error"](row(1))
+check(abs(e - 0.5) < 1e-9, "third is c1 -> +0.50 (%+.2f)" % e)
+e, n = ns["line_error"](row(1, 3))
+check(abs(e) < 1e-9 and n == 2, "middle pair c3+c1 -> centred (%+.2f, %d)" % (e, n))
 e, n = ns["line_error"](row(0, 1, 2, 3))
 check(abs(e) < 1e-9 and n == 4, "wide line covers the row -> centred (%+.2f)" % e)
 ns["FOLLOW_FLIP"] = True
 e, n = ns["line_error"](row(0))
-check(abs(e - 1.5) < 1e-9, "FOLLOW_FLIP swaps the sides (%+.2f)" % e)
+check(abs(e - 1.5) < 1e-9, "FOLLOW_FLIP mirrors the row (%+.2f)" % e)
 ns["FOLLOW_FLIP"] = False
 e, n = ns["line_error"]([3000, 3000, 3000, 3000])
 check(n == 0, "half-lit row (floor, no line) is not 'on the line'")
@@ -204,7 +210,7 @@ check(ns["following"] is False and any("not under the sensor" in s for s in conn
 reset()
 ns["estop_latched"] = True
 conn = FakeConn()
-nic.row = row(1, 2)
+nic.row = row(1, 3)
 ns["follow_start"](conn, None, None)
 check(ns["following"] is False and any("estop" in s for s in conn.sent),
       "refused while the e-stop is latched")
@@ -233,9 +239,9 @@ def steps(*errs, t0=None):
 
 reset()
 conn = FakeConn()
-nic.row = row(1)
+nic.row = row(3)                           # c3 = second from the left
 ns["follow_start"](conn, 45, None)
-steps(row(1), row(1))                      # hold: line under c1 (left of centre)
+steps(row(3), row(3))                      # line left of centre
 got = duties()
 check(got.get("A.fwd", 0) and got.get("A.fwd", 0) < got.get("B.fwd", 0)
       and got.get("D.fwd", 0) < got.get("C.fwd", 0) and "A.rev" not in got,
@@ -243,18 +249,18 @@ check(got.get("A.fwd", 0) and got.get("A.fwd", 0) < got.get("B.fwd", 0)
 
 reset()
 conn = FakeConn()
-nic.row = row(2)
+nic.row = row(1)                           # c1 = third from the left
 ns["follow_start"](conn, 45, None)
-steps(row(2), row(2))                      # line under c2 (right of centre)
+steps(row(1), row(1))                      # line right of centre
 got = duties()
 check(got.get("B.fwd", 0) < got.get("A.fwd", 0) and got.get("C.fwd", 0) < got.get("D.fwd", 0),
       "line right -> right wheels slow down (%s)" % got)
 
 reset()
 conn = FakeConn()
-nic.row = row(1, 2)
+nic.row = row(1, 3)
 ns["follow_start"](conn, 45, None)
-steps(row(1, 2), row(1, 2))
+steps(row(1, 3), row(1, 3))
 got = duties()
 check(len(set(got.values())) == 1 and len(got) == 4,
       "line centred -> all four wheels equal (%s)" % got)
@@ -262,9 +268,9 @@ check(len(set(got.values())) == 1 and len(got) == 4,
 reset()
 conn = FakeConn()
 ns["FOLLOW_FLIP"] = True                   # the mirrored sensor order
-nic.row = row(1)
+nic.row = row(3)
 ns["follow_start"](conn, 45, None)
-steps(row(1), row(1))
+steps(row(3), row(3))
 got = duties()
 check(got.get("B.fwd", 0) < got.get("A.fwd", 0),
       "mirrored sensors -> the same row corrects the other way (%s)" % got)
@@ -273,9 +279,9 @@ ns["FOLLOW_FLIP"] = False
 print("--- follow_step(): watchdog is fed, and a lost line stops the cart ---")
 reset()
 conn = FakeConn()
-nic.row = row(1, 2)
+nic.row = row(1, 3)
 ns["follow_start"](conn, 45, None)
-t = steps(row(1, 2))
+t = steps(row(1, 3))
 check(ns["move_dir"] == "follow" and ns["last_move_ms"] == t,
       "following counts as 'moving' for the watchdog")
 before = duties()
@@ -292,7 +298,7 @@ check(all(v == 0 for v in duties().values()) or duties() == {},
 print("--- commands: follow <0|1> [speed] [flip], manual takeover, brake ---")
 reset()
 conn = FakeConn()
-nic.row = row(1, 2)
+nic.row = row(1, 3)
 ns["handle_command"](conn, "follow 1 35 1")
 check(ns["following"] is True and ns["follow_speed"] == 35 and ns["FOLLOW_FLIP"] is True
       and any("reversed" in s for s in conn.sent),
@@ -309,7 +315,7 @@ check(ns["following"] is False and any("follow: off" in s for s in conn.sent),
 
 reset()
 conn = FakeConn()
-nic.row = row(1, 2)
+nic.row = row(1, 3)
 ns["follow_start"](conn, 45, None)
 conn.sent[:] = []
 ns["handle_command"](conn, "move f 60")
@@ -319,18 +325,18 @@ check(ns["move_dir"] == "f", "and the manual command drives (%s)" % ns["move_dir
 
 reset()
 conn = FakeConn()
-nic.row = row(1, 2)
+nic.row = row(1, 3)
 ns["follow_start"](conn, 45, None)
-steps(row(1, 2))
+steps(row(1, 3))
 ns["handle_command"](conn, "stop")
 check(ns["following"] is False and not duties(), "'stop' ends follow + stops the wheels")
 
 reset()
 conn = FakeConn()
-nic.row = row(1, 2)
+nic.row = row(1, 3)
 ns["fast_brake"] = True
 ns["follow_start"](conn, 45, None)
-steps(row(1, 2))
+steps(row(1, 3))
 ns["handle_command"](conn, "follow 0")
 got = duties()
 check(ns["following"] is False and set(got) == {"A.rev", "B.rev", "C.rev", "D.rev"},

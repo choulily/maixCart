@@ -63,6 +63,12 @@ AP_PASS = "maixcart123"
 TELEMETRY_FIELDS = ("ms", "dist", "c0", "c1", "c2", "c3", "c4", "onmask",
                     "big_arm", "little_arm", "rotation", "clamp", "flags",
                     "err", "hz")   # line-follow offset (x100) + tracker read rate
+# Physical placement of the tracker channels, cart left -> right (measured on
+# this cart: the row reads c0, c3, c1, c2).  TRK_ORDER is the display order (c4
+# is not wired, so it goes last) and TRK_SLOT[ch] the channel's place in the row
+# - the same mapping the bot's FOLLOW_ORDER uses.
+TRK_ORDER = (0, 3, 1, 2, 4)
+TRK_SLOT = {ch: slot for slot, ch in enumerate(TRK_ORDER) if ch != 4}
 SERVO_NAMES = ("big_arm", "little_arm", "rotation", "clamp")
 MOVE_KEYS = {"w": "f", "up": "f", "s": "b", "down": "b",
              "a": "l", "left": "l", "d": "r", "right": "r",
@@ -720,8 +726,12 @@ class App:
         # tracker
         tr = self._labelframe(mid, "Line tracker / 寻迹 (ADC)")
         tr.pack(side="left", fill="both", expand=True, padx=6)
-        self.trk = []
-        for ch in range(5):
+        # the rows are shown in *physical* order, cart left at the top, so the
+        # panel matches what you see under the cart (this tracker is wired
+        # c0, c3, c1, c2 across the row - see TRK_ORDER)
+        tk.Label(tr, text="cart left  ^", anchor="w", fg="#777777").pack(fill="x")
+        self.trk = [None] * 5
+        for ch in TRK_ORDER:
             row = ttk.Frame(tr)
             row.pack(fill="x", pady=1)
             tk.Label(row, text="c%d" % ch, width=3, anchor="w").pack(side="left")
@@ -732,7 +742,8 @@ class App:
             val.pack(side="left", padx=(4, 0))
             flag = tk.Label(row, text="  ", width=3, bg="#dddddd")
             flag.pack(side="left", padx=(4, 0))
-            self.trk.append((cv, item, val, flag))
+            self.trk[ch] = (cv, item, val, flag)
+        tk.Label(tr, text="cart right v", anchor="w", fg="#777777").pack(fill="x")
         self.line_label = tk.Label(tr, text="line: --", anchor="w", fg="#333333",
                                    font=("TkDefaultFont", 10, "bold"))
         self.line_label.pack(fill="x", pady=(6, 0))
@@ -1486,14 +1497,14 @@ class App:
         if not d["tracker_ok"]:
             text, color = "line: tracker read failed", "#b00020"
         elif on_list:
-            pos = sum(on_list) / float(len(on_list))
+            pos = sum(TRK_SLOT[ch] for ch in on_list) / float(len(on_list))
             if pos < 1.0:
                 where = "left"
             elif pos > 2.0:
                 where = "right"
             else:
                 where = "center"
-            text = "line: %s   (channels %s, pos %.1f/3)" % (
+            text = "line: %s   (channels %s, slot %.1f/3)" % (
                 where, ",".join(str(c) for c in on_list), pos)
             color = "#1b5e20"
         else:

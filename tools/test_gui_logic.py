@@ -218,6 +218,21 @@ settle(0.05)
 check(app._following is False and app.follow_btn.cget("text") == "Follow line",
       "and it goes back when the bot stops following")
 
+# the panel maps channels to their physical place in the row: c0, c3, c1, c2
+# from the cart's left to its right (measured on the cart)
+app._handle_line("T,1200,55,850,4095,4095,4095,0,1,6,0,0,0,-35,4,0,0")
+settle(0.05)
+t = app.line_label.cget("text")
+check("left" in t and "slot 0.0" in t, "c0 alone reads as the left slot (%r)" % t)
+app._handle_line("T,1300,55,4095,4095,4095,850,0,8,6,0,0,0,-35,4,0,0")
+settle(0.05)
+t = app.line_label.cget("text")
+check("slot 1.0" in t, "c3 alone is the second slot from the left (%r)" % t)
+app._handle_line("T,1400,55,4095,4095,850,4095,0,4,6,0,0,0,-35,4,0,0")
+settle(0.05)
+t = app.line_label.cget("text")
+check("right" in t and "slot 3.0" in t, "c2 alone reads as the right slot (%r)" % t)
+
 # ---- typing mode: keys are ignored while a text field has focus ---------------
 sent[:] = []
 app.root.focus_force()
