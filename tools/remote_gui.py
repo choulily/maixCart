@@ -413,6 +413,7 @@ def parse_telemetry(line):
     d["sonar_present"] = bool(d["flags"] & 2)
     d["tracker_ok"] = bool(d["flags"] & 4)
     d["wifi"] = bool(d["flags"] & 8)
+    d["brake"] = bool(d["flags"] & 16)
     if d["dist"] < 0:
         d["dist"] = None
     return d
@@ -590,7 +591,9 @@ class App:
         self._brake_logged = 0.0
         self._last_servo_key = {}
         self._wifi_ok = False
+        self._brake_ok = False
         self.log_keys = tk.BooleanVar(value=bool(cfg.get("log_keys", False)))
+        self.fast_brake = tk.BooleanVar(value=bool(cfg.get("fast_brake", True)))
         self.pad_deadzone = float(cfg.get("pad_deadzone", PAD_DEADZONE))
         self.pad_spin = cfg.get("pad_spin", "")
         self.pad = Gamepad(str(cfg.get("pad", "auto")),
@@ -811,6 +814,9 @@ class App:
         self.resume_btn.pack(side="left", padx=2)
         self.estop_btn = ttk.Button(ctl, text="E-STOP (Esc)", command=self._estop)
         self.estop_btn.pack(side="left", padx=2)
+        self.brake_btn = ttk.Checkbutton(ctl, text="fast brake", variable=self.fast_brake,
+                                         command=self._brake_toggled)
+        self.brake_btn.pack(side="left", padx=(12, 0))
 
         # ---- log ----
         logf = self._labelframe(root, "Log")
@@ -825,7 +831,8 @@ class App:
         help_txt = ("W/S fwd/back   A/D steer when driving / strafe when stopped   "
                     "Q/E spin   Space stop   Esc e-stop   R/F big arm   T/G little arm   "
                     "Y/H rotate   C/V grab/release   1-8 as above   P home (arm only, the "
-                    "clamp keeps its grip)   +/- speed   [ ] step   |   mouse: use the "
+                    "clamp keeps its grip)   +/- speed   [ ] step   fast brake = reverse "
+                    "pulse when a movement stops   |   mouse: use the "
                     "drive pad / +/- buttons (keys need the window focused, click once)"
                     "\ngamepad: L-stick drive + steer (strafe when stopped)   "
                     "R-stick sideways / spin in place   A/B clamp grab/release   X home   "
@@ -880,6 +887,10 @@ class App:
             self._resume()
         else:
             self._estop()
+
+    def _brake_toggled(self):
+        """Engage/disengage the bot's fast brake (reverse pulse on stop)."""
+        self._send("brake 1" if self.fast_brake.get() else "brake 0", "ok")
 
     def _toggle_listen(self):
         if self.link.listening:
@@ -1341,6 +1352,9 @@ class App:
                     elif part.startswith("open="):
                         self._open = int(part[5:])
                 self.clamp_label.configure(text="grab %d deg / open %d deg" % (self._grab, self._open))
+                # the fast-brake state lives in the bot: re-send what the
+                # checkbox says so it survives resets/uploads
+                self._send("brake 1" if self.fast_brake.get() else "brake 0")
         else:
             self.log("bot?: " + line, "info")
 
@@ -1349,6 +1363,7 @@ class App:
         self._last_dist = d["dist"]
         self.estop_latched = d["estop"]
         self._wifi_ok = d["wifi"]
+        self._brake_ok = d["brake"]
 
         # ultrasonic
         if d["dist"] is not None:
@@ -1440,10 +1455,14 @@ class App:
         if now - self._last_tel < STALE_TELEMETRY_S:
             up = "  estop LATCHED" if self.estop_latched else ""
         self.status.configure(text=state + rtt + up, fg="#b00020" if self.estop_latched else color)
-        note = "listening on %s   |   bot wifi: %s   |   pad: %s" % (
+        if now - self._last_tel < STALE_TELEMETRY_S:
+            brake = "on" if self._brake_ok else "off"
+        else:
+            brake = "on" if self.fast_brake.get() else "off"
+        note = "listening on %s   |   bot wifi: %s   |   pad: %s   |   fast brake: %s" % (
             self._listen_text() if self.link.listening else "-",
             "ok" if (now - self._last_tel < STALE_TELEMETRY_S and self._wifi_ok) else "?",
-            self.pad.note)
+            self.pad.note, brake)
         if self._typing():
             note += "   |   KEYBOARD -> text field (click the background to drive again)"
         self.substatus.configure(text=note)
@@ -1470,6 +1489,7 @@ class App:
             "speed": int(float(self.speed.get())), "step": float(self.step.get()),
             "brake": bool(self.brake_on.get()), "brake_cm": int(self.brake_cm.get()),
             "thr": self.thr_var.get(), "log_keys": bool(self.log_keys.get()),
+            "fast_brake": bool(self.fast_brake.get()),
             "pad": self.pad.want, "pad_deadzone": self.pad_deadzone,
             "pad_spin": self.pad_spin,
         }

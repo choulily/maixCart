@@ -232,6 +232,7 @@ One command per line, from the GUI to the bot:
 | `home` | arm servos to `SERVO_HOME` (the clamp keeps its grip) |
 | `estop` / `resume` | latch / clear the emergency stop |
 | `speed <0-100>` | default drive speed |
+| `brake <0\|1> [duty] [ms]` | engage/disengage the **fast brake**: a reverse pulse (default duty 40, 90 ms) the moment a movement stops, applied by the firmware so it needs no round trip; `stop`, the watchdog and the optional timeout use it, E-STOP never does |
 | `motor <A-D> <f\|r\|stop> [speed]` | drive ONE wheel only (wiring/polarity test; same watchdog as `move`) |
 | `thr <n>` | tracker "on the line" threshold (ADC below n = black) |
 | `tel` / `ping` | ask for telemetry / heartbeat (`P,<ms>` comes back) |
@@ -246,7 +247,32 @@ E,<text>    command/parse error          L,<text>    bot log line        P,<ms> 
 
 `dist` is cm (`-1` = no echo).  `onmask` bit *i* = tracker channel *i* is on the
 line.  `flags`: bit0 = estop latched, bit1 = ultrasonic sensor present,
-bit2 = tracker read ok, bit3 = WiFi connected.
+bit2 = tracker read ok, bit3 = WiFi connected, bit4 = fast brake engaged.
+
+## Fast brake / 快速刹车
+
+The fast brake stops the cart instead of letting it coast: when a movement ends
+(`stop` from the GUI, or the watchdog), the firmware drives every wheel that was
+moving the *other* way for `BRAKE_MS` (default 90 ms at duty `BRAKE_DUTY` = 40).
+It runs in the bot, so it happens the instant the stop arrives - no extra GUI or
+WiFi round trip, which is what makes it feel immediate (that is why the feature
+lives in `remote_bot.py` and not in the GUI).
+
+* **Engage it** with the GUI's **fast brake** checkbox (`brake 1`); the GUI
+  remembers the state and re-sends it whenever the bot says hello, so it
+  survives re-uploads.  `brake 0` disengages.  The telemetry flag bit4 and the
+  status line show what the bot is actually doing.
+* **Tuning**: `brake 1 <duty> <ms>` (or the constants at the top of
+  `remote_bot.py`).  More duty / longer = harder stop, bigger current spike;
+  keep it modest - the brake is a short reverse pulse, and the servos and ESP32
+  share the 5 V rail.
+* **It never fires on E-STOP** (an emergency stop must not drive the wheels at
+  all), nor for the one-wheel test buttons.  A new `move`/`mix` command cancels
+  a running pulse immediately.
+* Optional: `BRAKE_TIMEOUT_MS` (default 0 = off) brakes when no drive command
+  arrived for that long, without waiting for the GUI's `stop` - it makes the
+  stop even snappier, but only enable it once the link is quick (the GUI's
+  keep-alive is every 150 ms, so 300 ms or more is safe).
 
 ## Cart-side configuration / 车上配置
 

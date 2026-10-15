@@ -169,6 +169,22 @@ release("s")
 release("w")
 settle(0.3)
 
+# ---- fast brake: the checkbox drives the bot's firmware state -----------------
+sent[:] = []
+app.fast_brake.set(True)
+app._brake_toggled()
+settle(0.05)
+check("brake 1" in sent, "fast-brake checkbox engages it (%r)" % sent[:2])
+app.fast_brake.set(False)
+app._brake_toggled()
+settle(0.05)
+check("brake 0" in sent, "unchecking disengages it")
+sent[:] = []
+app.fast_brake.set(True)
+app._handle_line("L,hello ip=10.0.0.9 fw=1 sonar=(31, 30) servos={} grab=40 open=-35")
+settle(0.05)
+check("brake 1" in sent, "the state is re-sent when the bot connects")
+
 # ---- typing mode: keys are ignored while a text field has focus ---------------
 sent[:] = []
 app.root.focus_force()

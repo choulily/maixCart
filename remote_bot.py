@@ -46,6 +46,11 @@
 # Safety / 安全:
 #   * watchdog: if no 'move' command arrives within WATCHDOG_MS the motors stop by
 #     themselves (dead WiFi / closed GUI can never leave the cart driving)
+#   * fast brake ('brake 1' or the GUI's checkbox): when a movement stops, each
+#     moving wheel is driven the other way for BRAKE_MS - in the firmware, so it
+#     happens the moment the stop arrives instead of coasting; it stays off
+#     until it is engaged, never fires on E-STOP (safety = no movement) and a
+#     new movement command cancels a running pulse
 #   * if nothing is received from the GUI for LINK_TIMEOUT_MS the bot reconnects
 #     (the GUI sends 'ping' every ~1.5 s, and telemetry keeps flowing the other way)
 #   * 'estop' latches: motors stop, servos go loose, motion commands are ignored
@@ -99,6 +104,17 @@ MOTOR_RAMP_DUTY_PER_TICK = 6   # soft start/stop: duty units added per loop tick
 RELEASE_SERVOS_WHILE_DRIVING = False   # True: arm goes limp while the wheels run
                                # (helps if the servos buzz or brown out while
                                #  driving - but a grabbed object would be dropped)
+# Fast brake / 快速刹车: when a movement is stopped ('stop' command or watchdog),
+# briefly drive each wheel the *other* way (plugging) so the cart stops instead
+# of coasting.  Doing it in the firmware means it happens the moment the stop
+# arrives - no extra GUI/WiFi round trip.  Off by default; 'brake 1' or the
+# GUI's "fast brake" checkbox enables it (the GUI re-sends it on connect).
+FAST_BRAKE = False      # default state; 'brake <0|1> [duty] [ms]' changes it
+BRAKE_DUTY = 40         # reverse duty of the brake pulse (keep it modest: it is
+BRAKE_MS = 90           # a current spike) and how long it lasts
+BRAKE_TIMEOUT_MS = 0    # >0: also brake when no 'move' arrived for this long
+                        #     (fast, but only safe with a snappy link: the GUI's
+                        #      keep-alive is 150 ms, so >=300 ms is sensible)
 SERVO_STEP_DEG = 2.5    # servo easing speed, degrees per loop tick (~125 deg/s)
 TRACKER_THRESH = 2000   # tracker ADC reading below this = "on the line"
 SONAR_TIMEOUT_US = 20000  # give up on one ping after 20 ms (~3.4 m max)
@@ -217,6 +233,8 @@ estop_latched = False
 servos_released = False
 speed = SPEED
 tracker_thresh = TRACKER_THRESH
+fast_brake = FAST_BRAKE   # 'brake on/off' (the GUI's checkbox re-sends it)
+brake_until_ms = 0        # while set, the wheels are actively braking
 
 
 def setup_motors():
@@ -280,6 +298,8 @@ def apply_mix(x, y, w, spd):
     so the fastest wheel turns at `spd` duty: the per-wheel differential steers
     the cart while it drives.
     """
+    global brake_until_ms
+    brake_until_ms = 0                       # a new movement cancels a brake pulse
     comp = {}
     for name in "ABCD":
         sx, sy, sw = WHEEL_MIX[name]
@@ -304,8 +324,10 @@ def apply_move(code, spd):
 
 def drive_one_motor(name, up, spd):
     """Aim a single wheel (used by the wheel test commands)."""
+    global brake_until_ms
     if name not in MOTORS:
         return False
+    brake_until_ms = 0
     for other in "ABCD":                       # everything else stops
         set_duty(other, True, 0)
         set_duty(other, False, 0)
@@ -334,8 +356,9 @@ def service_motors():
 
 def stop_motors():
     """Stop now (no ramp) - this is the safety path."""
-    global move_dir
+    global move_dir, brake_until_ms
     move_dir = None
+    brake_until_ms = 0
     for i in range(8):
         DUTY_TARGET[i] = 0
         if DUTY_NOW[i]:
@@ -345,6 +368,52 @@ def stop_motors():
             pwm = MOTORS[name][role]
             if pwm:
                 pwm.duty(0)
+
+
+def begin_brake():
+    """Fast brake: drive every moving wheel the other way for BRAKE_MS.
+
+    Called where a movement stops ('stop', the watchdog): the reverse pulse
+    kills the momentum right away instead of letting the cart coast, and it is
+    written straight to the pins (no ramp) so the action is instant.  Returns
+    False when braking is off or nothing was moving (caller stops normally).
+    """
+    global move_dir, brake_until_ms
+    if not fast_brake or brake_until_ms:
+        return False
+    plan = {}
+    for name in "ABCD":
+        for role in MOTOR_ROLES:
+            slot = MOTOR_SLOT.get((name, role))
+            if slot is None or not DUTY_TARGET[slot]:
+                continue
+            other = "rev" if role == "fwd" else "fwd"
+            other_slot = MOTOR_SLOT.get((name, other))
+            plan[slot] = 0
+            if other_slot is not None:
+                plan[other_slot] = BRAKE_DUTY          # the wheel spins backwards
+    if not plan:
+        return False
+    for i in range(8):
+        duty = plan.get(i, 0)
+        DUTY_TARGET[i] = duty
+        DUTY_NOW[i] = duty
+        if SLOT_PWM[i]:
+            SLOT_PWM[i].duty(duty)
+    move_dir = None
+    brake_until_ms = _ticks_ms() + BRAKE_MS
+    return True
+
+
+def brake_done():
+    """End a running brake pulse (called from the main loop). True if it did."""
+    global brake_until_ms
+    if not brake_until_ms:
+        return False
+    if _ticks_diff(_ticks_ms(), brake_until_ms) < 0:
+        return False                       # still braking
+    stop_motors()
+    return True
 
 
 # ==================== servos ====================
@@ -622,6 +691,7 @@ def is_idle_error(err):
 def handle_command(conn, line):
     """Run one command line."""
     global move_dir, last_move_ms, estop_latched, speed, tracker_thresh
+    global fast_brake, BRAKE_DUTY, BRAKE_MS
     parts = line.split()
     if not parts:
         return
@@ -667,7 +737,23 @@ def handle_command(conn, line):
         last_move_ms = _ticks_ms()
 
     elif cmd == "stop":
-        stop_motors()
+        if not begin_brake():              # fast brake first, normal stop else
+            stop_motors()
+
+    elif cmd == "brake":
+        # brake <0|1> [duty] [ms] - engage/disengage the fast brake (the GUI's
+        # "fast brake" checkbox sends 'brake 1' / 'brake 0' on connect)
+        try:
+            value = args[0].lower() if args else "1"
+            fast_brake = value in ("1", "on", "true", "yes")
+            if len(args) > 1:
+                BRAKE_DUTY = max(0, min(100, int(float(args[1]))))
+            if len(args) > 2:
+                BRAKE_MS = max(10, min(2000, int(float(args[2]))))
+            send_line(conn, "L,fast brake %s (duty %d, %d ms)" % (
+                "on" if fast_brake else "off", BRAKE_DUTY, BRAKE_MS))
+        except Exception:
+            send_line(conn, "E,brake usage: brake <0|1> [duty] [ms]")
 
     elif cmd in ("motor", "wheel") and len(args) >= 2:
         name = args[0].upper()
@@ -839,14 +925,21 @@ def serve(conn, sonar):
                 if len(buf) > 1024:                # garbage guard
                     buf = buf[-1024:]
 
+        # ---- fast brake: end the pulse once it has run its time ----
+        brake_done()
+
         # ---- watchdog: a lost link must never leave the wheels running ----
         if move_dir is not None and _ticks_diff(now, last_move_ms) > WATCHDOG_MS:
-            stop_motors()
+            if not begin_brake():
+                stop_motors()
             print("remote_bot: watchdog stop (no 'move' for %d ms)" % WATCHDOG_MS)
             try:
                 send_line(conn, "L,watchdog stop")
             except Exception:
                 pass
+        elif move_dir is not None and BRAKE_TIMEOUT_MS and \
+                _ticks_diff(now, last_move_ms) > BRAKE_TIMEOUT_MS:
+            begin_brake()          # optional: brake without waiting for 'stop'
 
         # ---- optional: let the arm go loose while the wheels are running ----
         if RELEASE_SERVOS_WHILE_DRIVING and not estop_latched:
@@ -894,6 +987,8 @@ def serve(conn, sonar):
                     pass
             if estop_latched:
                 flags |= 1
+            if fast_brake:
+                flags |= 16                        # bit4: fast brake engaged
             if NIC.isconnected():
                 flags |= 8
             vals = (_ticks_ms(), dist,

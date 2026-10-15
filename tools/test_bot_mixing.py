@@ -211,6 +211,56 @@ check(any("estop" in s for s in conn.sent) and duties() == {},
       "mix refused while latched (%r)" % (conn.sent,))
 ns["estop_latched"] = False
 
+print("--- fast brake ---")
+ns["stop_motors"]()
+ns["fast_brake"] = True
+ns["brake_until_ms"] = 0
+ns["apply_move"]("f", 60)
+check(ns["begin_brake"]() is True, "begin_brake() engages while moving")
+got = duties()
+check(got == {"A.rev": 40, "B.rev": 40, "C.rev": 40, "D.rev": 40},
+      "brake pulses every wheel backwards (%s)" % got)
+check(ns["move_dir"] is None and ns["brake_until_ms"],
+      "brake clears move_dir and arms the timer")
+
+ns["apply_move"]("f", 60)
+check(ns["brake_until_ms"] == 0, "a new movement cancels the running brake")
+check(duties() == {"A.fwd": 60, "B.fwd": 60, "C.fwd": 60, "D.fwd": 60},
+      "and the cart drives again")
+
+ns["stop_motors"]()
+ns["fast_brake"] = False
+ns["apply_move"]("f", 60)
+check(ns["begin_brake"]() is False, "no brake while it is disengaged")
+check(duties() == {"A.fwd": 60, "B.fwd": 60, "C.fwd": 60, "D.fwd": 60},
+      "wheels keep their target instead")
+
+ns["fast_brake"] = True
+ns["stop_motors"]()
+ns["apply_move"]("f", 60)
+ns["begin_brake"]()
+ns["brake_until_ms"] = ns["_ticks_ms"]() - 10   # pretend BRAKE_MS has elapsed
+check(ns["brake_done"]() is True and duties() == {}, "brake_done() stops the wheels")
+check(ns["brake_done"]() is False, "brake_done() is harmless when idle")
+
+ns["stop_motors"]()
+ns["fast_brake"] = True
+ns["apply_move"]("f", 60)
+ns["handle_command"](FakeConn(), "stop")
+got = duties()
+check(got == {"A.rev": 40, "B.rev": 40, "C.rev": 40, "D.rev": 40},
+      "'stop' brakes instead of coasting (%s)" % got)
+
+conn = FakeConn()
+ns["handle_command"](conn, "brake 1 30 120")
+check(ns["fast_brake"] is True and ns["BRAKE_DUTY"] == 30 and ns["BRAKE_MS"] == 120
+      and any("fast brake" in s for s in conn.sent),
+      "the brake command tunes duty/time (%r)" % (conn.sent,))
+conn.sent[:] = []
+ns["handle_command"](conn, "brake 0")
+check(ns["fast_brake"] is False and any("off" in s for s in conn.sent),
+      "brake 0 disengages (%r)" % (conn.sent,))
+
 print()
 print("FAILED: %d" % len(fails))
 for f in fails:
