@@ -7,9 +7,13 @@
 #     (tools/remote_gui.py) is running - the K210's socket cannot listen, so the
 #     GUI must be the server.  That also means the cart needs no fixed IP.
 #   * receives one-line commands: drive the 4 mecanum wheels, move the 4 arm
-#     servos, emergency stop, ...
+#     servos, emergency stop, follow the line, ...
 #   * answers with one telemetry line ~5x per second:
-#     ultrasonic distance + the 5 tracker ADC channels + servo angles
+#     ultrasonic distance + the 5 tracker ADC channels + servo angles +
+#     the line-following state
+#   * 'follow 1' makes the cart drive itself along the black line: the tracker
+#     is read here, in the firmware, ~50x per second and the wheels are steered
+#     from that - no command round trip, which is what keeps it on the line.
 #
 # Servos / 舵机 (Timer2, 50 Hz):
 #   big arm    -> IO3       little arm -> IO10
@@ -115,6 +119,23 @@ BRAKE_MS = 90           # a current spike) and how long it lasts
 BRAKE_TIMEOUT_MS = 0    # >0: also brake when no 'move' arrived for this long
                         #     (fast, but only safe with a snappy link: the GUI's
                         #      keep-alive is 150 ms, so >=300 ms is sensible)
+# Line following / 寻迹 (the firmware drives): 'follow 1' reads the IR tracker
+# over the ESP32 SPI link and steers the wheels from it ~50x per second, which
+# no command round trip through the GUI could match - that is why it lives
+# here.  'follow 0', any manual drive command or the e-stop takes the wheels
+# back; the line ending under the sensor also stops it.
+FOLLOW_SPEED = 45       # forward duty while following (fastest wheel)
+FOLLOW_MIN_W = 160      # a channel "sees the line" when its reading is this far
+                        # below the threshold (line ~850, white board ~4095,
+                        # so 160 is a small noise guard)
+FOLLOW_KP = 30          # correction per channel of line offset (duty units)
+FOLLOW_KD = 45          # damping: per channel of offset change per second
+FOLLOW_MIX_Y = 0.6      # 60% of the correction strafes sideways ...
+FOLLOW_MIX_W = 0.4      # ... 40% spins, so the cart also turns into the line
+FOLLOW_LOST_MS = 400    # line gone: keep the last command this long, then stop
+FOLLOW_PERIOD_MS = 20   # control cycle (as fast as the SPI read allows)
+FOLLOW_FLIP = False     # True if channel 0 is the cart's *right* sensor
+                        # (the GUI's "mirror sensors" checkbox sends this)
 SERVO_STEP_DEG = 2.5    # servo easing speed, degrees per loop tick (~125 deg/s)
 TRACKER_THRESH = 2000   # tracker ADC reading below this = "on the line"
 SONAR_TIMEOUT_US = 20000  # give up on one ping after 20 ms (~3.4 m max)
@@ -235,6 +256,16 @@ speed = SPEED
 tracker_thresh = TRACKER_THRESH
 fast_brake = FAST_BRAKE   # 'brake on/off' (the GUI's checkbox re-sends it)
 brake_until_ms = 0        # while set, the wheels are actively braking
+following = False         # 'follow 1': the firmware is driving itself
+follow_speed = FOLLOW_SPEED
+follow_err = 0.0          # last line offset, channel units (+ = line is right)
+follow_prev_e = 0.0
+follow_prev_ms = 0
+follow_lost_ms = 0        # when the line was last seen under the sensor
+follow_reads = 0          # tracker reads in the current second (diagnostics)
+follow_hz = 0
+follow_hz_ms = 0
+last_adc = None           # newest tracker reading, shared with the telemetry
 
 
 def setup_motors():
@@ -356,9 +387,10 @@ def service_motors():
 
 def stop_motors():
     """Stop now (no ramp) - this is the safety path."""
-    global move_dir, brake_until_ms
+    global move_dir, brake_until_ms, following
     move_dir = None
     brake_until_ms = 0
+    following = False            # any stop ends line following
     for i in range(8):
         DUTY_TARGET[i] = 0
         if DUTY_NOW[i]:
@@ -378,7 +410,8 @@ def begin_brake():
     written straight to the pins (no ramp) so the action is instant.  Returns
     False when braking is off or nothing was moving (caller stops normally).
     """
-    global move_dir, brake_until_ms
+    global move_dir, brake_until_ms, following
+    following = False            # a brake is a stop: following ends with it
     if not fast_brake or brake_until_ms:
         return False
     plan = {}
@@ -414,6 +447,135 @@ def brake_done():
         return False                       # still braking
     stop_motors()
     return True
+
+
+# ==================== line following / 寻迹 ====================
+def read_tracker():
+    """One ADC read of the tracker channels (the caller handles failures)."""
+    return NIC.adc((0, 1, 2, 3, 4))
+
+
+def line_error(adc):
+    """Where the line sits under the sensor row, in channel units.
+
+    Every channel that sees black pulls the estimate its way, weighted by *how*
+    black it is.  That keeps working when a wide line covers the whole row (all
+    dark = centred, error 0) and when only the edge sensor is on the line.
+    Returns (error, seen): + means the line is to the cart's right, seen == 0
+    means the line is not under the sensor at all.  FOLLOW_FLIP swaps the sides
+    when the tracker is mounted (or wired) the other way round.
+    """
+    total = 0.0
+    acc = 0.0
+    seen = 0
+    for ch in range(4):
+        w = tracker_thresh - adc[ch]
+        if w < FOLLOW_MIN_W:
+            continue
+        if w > tracker_thresh:
+            w = tracker_thresh
+        idx = (3 - ch) if FOLLOW_FLIP else ch
+        acc += idx * w
+        total += w
+        seen += 1
+    if not seen:
+        return 0.0, 0
+    return acc / total - 1.5, seen
+
+
+def follow_cancel(conn=None):
+    """A manual drive command takes the wheels back (no brake, no stop)."""
+    global following
+    if not following:
+        return False
+    following = False
+    if conn is not None:
+        send_line(conn, "L,follow: off (manual control)")
+    return True
+
+
+def follow_stop(conn=None, why="off"):
+    """Leave follow mode and stop the wheels (fast brake if it is engaged)."""
+    global following
+    was = following
+    following = False
+    if not begin_brake():              # begin_brake clears 'following' too
+        stop_motors()
+    if conn is not None and was:
+        send_line(conn, "L,follow: %s" % why)
+
+
+def follow_start(conn, spd=None, flip=None):
+    """Engage line following - requires the line under the sensor row."""
+    global following, follow_speed, follow_prev_e, follow_prev_ms, follow_lost_ms
+    global FOLLOW_FLIP
+    if estop_latched:
+        send_line(conn, "E,estop is latched - send 'resume' first")
+        return False
+    if flip is not None:
+        FOLLOW_FLIP = flip
+    if spd is not None:
+        follow_speed = max(0, min(100, spd))
+    if following:                      # already running: just take the settings
+        send_line(conn, "L,follow: still on, speed %d, sensors %s" % (
+            follow_speed, "reversed" if FOLLOW_FLIP else "as-is"))
+        return True
+    try:
+        adc = read_tracker()
+    except Exception as e:
+        send_line(conn, "E,cannot read the tracker (%r)" % (e,))
+        return False
+    err, seen = line_error(adc)
+    if not seen:
+        send_line(conn, "E,line is not under the sensor - put the cart on the strip")
+        return False
+    now = _ticks_ms()
+    following = True
+    follow_prev_e = err
+    follow_prev_ms = now
+    follow_lost_ms = now
+    send_line(conn, "L,follow: on, speed %d, sensors %s, line offset %+.2f" % (
+        follow_speed, "reversed" if FOLLOW_FLIP else "as-is", err))
+    return True
+
+
+def follow_step(conn, now):
+    """One control cycle: read the tracker, steer the wheels (called from serve)."""
+    global follow_err, follow_prev_e, follow_prev_ms, follow_lost_ms
+    global follow_reads, follow_hz, follow_hz_ms, last_adc, move_dir, last_move_ms
+    follow_reads += 1
+    if _ticks_diff(now, follow_hz_ms) >= 1000:
+        elapsed = max(1, _ticks_diff(now, follow_hz_ms))
+        follow_hz = int(follow_reads * 1000.0 / elapsed)
+        follow_reads = 0
+        follow_hz_ms = now
+    try:
+        adc = read_tracker()
+        last_adc = adc
+        err, seen = line_error(adc)
+    except Exception:
+        err, seen = 0.0, 0
+    if seen:
+        dt = _ticks_diff(now, follow_prev_ms) / 1000.0
+        if dt <= 0:
+            dt = FOLLOW_PERIOD_MS / 1000.0
+        if dt > 0.5:                   # a stall must not blow the D term up
+            dt = 0.5
+        de = (err - follow_prev_e) / dt
+        u = FOLLOW_KP * err + FOLLOW_KD * de
+        y = int(max(-100.0, min(100.0, u * FOLLOW_MIX_Y)))
+        w = int(max(-100.0, min(100.0, u * FOLLOW_MIX_W)))
+        apply_mix(follow_speed, y, w, follow_speed)
+        move_dir = "follow"
+        last_move_ms = now             # we are the driver now: feed the watchdog
+        follow_err = err
+        follow_prev_e = err
+        follow_prev_ms = now
+        follow_lost_ms = now
+        return
+    # nothing under the sensor: keep the last command for a moment, then stop
+    if _ticks_diff(now, follow_lost_ms) > FOLLOW_LOST_MS:
+        follow_stop(conn, "line lost - stopped")
 
 
 # ==================== servos ====================
@@ -702,6 +864,7 @@ def handle_command(conn, line):
         if estop_latched:
             send_line(conn, "E,estop is latched - send 'resume' first")
             return
+        follow_cancel(conn)
         code = args[0]
         try:
             spd = int(float(args[1])) if len(args) > 1 else speed
@@ -728,6 +891,7 @@ def handle_command(conn, line):
         except Exception:
             send_line(conn, "E,mix needs numbers: mix <fwd> <strafe> <spin> [speed]")
             return
+        follow_cancel(conn)
         x = max(-100, min(100, x))
         y = max(-100, min(100, y))
         w = max(-100, min(100, w))
@@ -755,6 +919,21 @@ def handle_command(conn, line):
         except Exception:
             send_line(conn, "E,brake usage: brake <0|1> [duty] [ms]")
 
+    elif cmd == "follow":
+        # follow <0|1> [speed] [flip] - autonomous line following (IR tracker):
+        # the firmware reads the sensor and steers the wheels itself
+        value = args[0].lower() if args else "1"
+        if value in ("1", "on", "true", "yes"):
+            try:
+                spd = int(float(args[1])) if len(args) > 1 else None
+                flip = bool(int(float(args[2]))) if len(args) > 2 else None
+            except Exception:
+                send_line(conn, "E,follow usage: follow <0|1> [speed] [flip]")
+                return
+            follow_start(conn, spd, flip)
+        else:
+            follow_stop(conn, "off")
+
     elif cmd in ("motor", "wheel") and len(args) >= 2:
         name = args[0].upper()
         what = args[1].lower()
@@ -774,6 +953,7 @@ def handle_command(conn, line):
                 stop_motors()
                 send_line(conn, "L,motor %s stopped" % name)
             else:
+                follow_cancel(conn)
                 up = (what == "f")
                 if MOTOR_SLOT.get((name, "fwd" if up else "rev")) is None:
                     send_line(conn, "E,motor %s %s direction is not wired on this cart"
@@ -863,7 +1043,7 @@ def handle_command(conn, line):
 # ==================== link loop ====================
 def serve(conn, sonar):
     """Talk to the GUI until the link breaks."""
-    global move_dir, last_move_ms
+    global move_dir, last_move_ms, last_adc
     buf = b""
     now = _ticks_ms()
     last_telemetry = now - TELEMETRY_MS
@@ -874,6 +1054,7 @@ def serve(conn, sonar):
     sonar_turn = False
     adc_turn = False
     last_adc = None
+    last_follow_ms = now - FOLLOW_PERIOD_MS
     empty_recvs = 0
     recv_errs = 0
 
@@ -928,6 +1109,11 @@ def serve(conn, sonar):
         # ---- fast brake: end the pulse once it has run its time ----
         brake_done()
 
+        # ---- line following: read the tracker and steer, right here ----
+        if following and _ticks_diff(now, last_follow_ms) >= FOLLOW_PERIOD_MS:
+            last_follow_ms = now
+            follow_step(conn, now)
+
         # ---- watchdog: a lost link must never leave the wheels running ----
         if move_dir is not None and _ticks_diff(now, last_move_ms) > WATCHDOG_MS:
             if not begin_brake():
@@ -962,16 +1148,16 @@ def serve(conn, sonar):
             if sonar.trig is not None:
                 flags |= 2                         # ultrasonic sensor detected
                 sonar_turn = not sonar_turn
-                if sonar_turn:                     # ping every other cycle: a
+                if sonar_turn and not following:   # ping every other cycle: a
                     d = sonar.ping()               # missing echo blocks the loop
                     if d is not None:              # for up to 40 ms, which would
-                        last_dist = dist = int(d)  # delay incoming commands
+                        last_dist = dist = int(d)  # delay the follow controller
             adc = (-1, -1, -1, -1, -1)
             onmask = 0
             adc_turn = not adc_turn
-            if not adc_turn and last_adc is not None:
-                adc = last_adc                       # reuse: the SPI read blocks
-                flags |= 4                           # the loop like the sonar ping
+            if following or (not adc_turn and last_adc is not None):
+                adc = last_adc if last_adc is not None else adc
+                flags |= 4                           # fresh while following
                 for ch in range(4):
                     if adc[ch] < tracker_thresh:
                         onmask |= (1 << ch)
@@ -989,13 +1175,15 @@ def serve(conn, sonar):
                 flags |= 1
             if fast_brake:
                 flags |= 16                        # bit4: fast brake engaged
+            if following:
+                flags |= 32                        # bit5: firmware is driving
             if NIC.isconnected():
                 flags |= 8
             vals = (_ticks_ms(), dist,
                     adc[0], adc[1], adc[2], adc[3], adc[4], onmask,
                     SERVO["big_arm"]["angle10"] // 10, SERVO["little_arm"]["angle10"] // 10,
                     SERVO["rotation"]["angle10"] // 10, SERVO["clamp"]["angle10"] // 10,
-                    flags)
+                    flags, int(round(follow_err * 100)), follow_hz)
             send_line(conn, "T," + ",".join([str(v) for v in vals]))
 
         # ---- link liveness: the GUI pings every ~1.5 s ----

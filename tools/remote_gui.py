@@ -61,7 +61,8 @@ AP_PASS = "maixcart123"
 
 # ---------------------------------------------------------------- protocol ---
 TELEMETRY_FIELDS = ("ms", "dist", "c0", "c1", "c2", "c3", "c4", "onmask",
-                    "big_arm", "little_arm", "rotation", "clamp", "flags")
+                    "big_arm", "little_arm", "rotation", "clamp", "flags",
+                    "err", "hz")   # line-follow offset (x100) + tracker read rate
 SERVO_NAMES = ("big_arm", "little_arm", "rotation", "clamp")
 MOVE_KEYS = {"w": "f", "up": "f", "s": "b", "down": "b",
              "a": "l", "left": "l", "d": "r", "right": "r",
@@ -405,8 +406,8 @@ def key_name(event):
 def parse_telemetry(line):
     """'T,...' -> dict of ints, or None if the line is not telemetry."""
     parts = line.split(",")
-    if len(parts) != len(TELEMETRY_FIELDS) + 1 or parts[0] != "T":
-        return None
+    if len(parts) < len(TELEMETRY_FIELDS) + 1 or parts[0] != "T":
+        return None                          # extra fields are ignored
     try:
         vals = [int(p) for p in parts[1:]]
     except ValueError:
@@ -418,6 +419,7 @@ def parse_telemetry(line):
     d["tracker_ok"] = bool(d["flags"] & 4)
     d["wifi"] = bool(d["flags"] & 8)
     d["brake"] = bool(d["flags"] & 16)
+    d["following"] = bool(d["flags"] & 32)
     if d["dist"] < 0:
         d["dist"] = None
     return d
@@ -600,6 +602,9 @@ class App:
         self._ap_on = False
         self.log_keys = tk.BooleanVar(value=bool(cfg.get("log_keys", False)))
         self.fast_brake = tk.BooleanVar(value=bool(cfg.get("fast_brake", True)))
+        self.follow_speed = tk.IntVar(value=int(cfg.get("follow_speed", 45)))
+        self.follow_flip = tk.BooleanVar(value=bool(cfg.get("follow_flip", False)))
+        self._following = False
         self.pad_deadzone = float(cfg.get("pad_deadzone", PAD_DEADZONE))
         self.pad_spin = cfg.get("pad_spin", "")
         self.pad = Gamepad(str(cfg.get("pad", "auto")),
@@ -825,6 +830,15 @@ class App:
         self.brake_btn = ttk.Checkbutton(ctl, text="fast brake", variable=self.fast_brake,
                                          command=self._brake_toggled)
         self.brake_btn.pack(side="left", padx=(12, 0))
+        self.follow_btn = ttk.Button(ctl, text="Follow line", command=self._follow_toggled)
+        self.follow_btn.pack(side="left", padx=(12, 0))
+        ttk.Label(ctl, text="follow speed").pack(side="left", padx=(6, 0))
+        self._field(ttk.Spinbox(ctl, from_=0, to=100, increment=5, textvariable=self.follow_speed,
+                                width=4)).pack(side="left", padx=(4, 2))
+        self.follow_flip_btn = ttk.Checkbutton(ctl, text="mirror sensors",
+                                               variable=self.follow_flip,
+                                               command=self._follow_flip_toggled)
+        self.follow_flip_btn.pack(side="left", padx=(6, 0))
 
         # ---- log ----
         logf = self._labelframe(root, "Log")
@@ -840,7 +854,8 @@ class App:
                     "Q/E spin   Space stop   Esc e-stop   R/F big arm   T/G little arm   "
                     "Y/H rotate   C/V grab/release   1-8 as above   P home (arm only, the "
                     "clamp keeps its grip)   +/- speed   [ ] step   fast brake = reverse "
-                    "pulse when a movement stops   |   mouse: use the "
+                    "pulse when a movement stops   Follow line = drives itself along the "
+                    "black strip (mirror sensors if it steers away)   |   mouse: use the "
                     "drive pad / +/- buttons (keys need the window focused, click once)"
                     "\ngamepad: L-stick drive + steer (strafe when stopped)   "
                     "R-stick sideways / spin in place   A/B clamp grab/release   X home   "
@@ -899,6 +914,20 @@ class App:
     def _brake_toggled(self):
         """Engage/disengage the bot's fast brake (reverse pulse on stop)."""
         self._send("brake 1" if self.fast_brake.get() else "brake 0", "ok")
+
+    def _follow_toggled(self):
+        """Engage/disengage line following (the firmware drives itself)."""
+        if self._following:
+            self._send("follow 0", "ok")
+        else:
+            self._send("follow 1 %d %d" % (self.follow_speed.get(),
+                                           1 if self.follow_flip.get() else 0), "ok")
+
+    def _follow_flip_toggled(self):
+        """Mirror the sensor order; if following, restart right away so it takes."""
+        if self._following:
+            self._send("follow 1 %d %d" % (self.follow_speed.get(),
+                                           1 if self.follow_flip.get() else 0), "ok")
 
     def _toggle_listen(self):
         if self.link.listening:
@@ -1414,6 +1443,10 @@ class App:
         self.estop_latched = d["estop"]
         self._wifi_ok = d["wifi"]
         self._brake_ok = d["brake"]
+        if d["following"] != self._following:          # the bot is the truth:
+            self._following = d["following"]           # it can stop by itself
+            self.follow_btn.configure(text="Stop follow" if self._following
+                                      else "Follow line")
 
         # ultrasonic
         if d["dist"] is not None:
@@ -1451,20 +1484,27 @@ class App:
             else:
                 flag.configure(bg="#dddddd", text="  ")
         if not d["tracker_ok"]:
-            self.line_label.configure(text="line: tracker read failed", fg="#b00020")
+            text, color = "line: tracker read failed", "#b00020"
         elif on_list:
             pos = sum(on_list) / float(len(on_list))
             if pos < 1.0:
-                text = "left"
+                where = "left"
             elif pos > 2.0:
-                text = "right"
+                where = "right"
             else:
-                text = "center"
-            self.line_label.configure(text="line: %s   (channels %s, pos %.1f/3)"
-                                           % (text, ",".join(str(c) for c in on_list), pos),
-                                      fg="#1b5e20")
+                where = "center"
+            text = "line: %s   (channels %s, pos %.1f/3)" % (
+                where, ",".join(str(c) for c in on_list), pos)
+            color = "#1b5e20"
         else:
-            self.line_label.configure(text="line: none (all channels bright / off the line)", fg="#555555")
+            text = "line: none (all channels bright / off the line)"
+            color = "#555555"
+        if d["following"]:
+            # the numbers the follow controller works with: offset in channel
+            # units (+ = line to the cart's right) and the tracker read rate
+            text += "   |   follow: offset %+0.2f, %d Hz" % (d["err"] / 100.0, d["hz"])
+            color = "#0d47a1"
+        self.line_label.configure(text=text, fg=color)
 
         # servos
         for name in SERVO_NAMES:
@@ -1540,6 +1580,8 @@ class App:
             "brake": bool(self.brake_on.get()), "brake_cm": int(self.brake_cm.get()),
             "thr": self.thr_var.get(), "log_keys": bool(self.log_keys.get()),
             "fast_brake": bool(self.fast_brake.get()),
+            "follow_speed": int(self.follow_speed.get()),
+            "follow_flip": bool(self.follow_flip.get()),
             "pad": self.pad.want, "pad_deadzone": self.pad_deadzone,
             "pad_spin": self.pad_spin,
         }

@@ -185,6 +185,39 @@ app._handle_line("L,hello ip=10.0.0.9 fw=1 sonar=(31, 30) servos={} grab=40 open
 settle(0.05)
 check("brake 1" in sent, "the state is re-sent when the bot connects")
 
+# ---- line following: the button, the mirror checkbox and the telemetry --------
+sent[:] = []
+app._following = False
+app.follow_speed.set(45)
+app.follow_flip.set(False)
+app._follow_toggled()
+settle(0.05)
+check("follow 1 45 0" in sent, "Follow sends the speed + sensor order (%r)" % sent[:2])
+sent[:] = []
+app._following = True                       # the bot says it is driving itself
+app._follow_toggled()
+settle(0.05)
+check("follow 0" in sent, "the button stops it once the bot reports following")
+sent[:] = []
+app.follow_flip.set(True)
+app._follow_flip_toggled()
+settle(0.05)
+check("follow 1 45 1" in sent, "mirroring while running re-sends the settings (%r)" % sent[:2])
+app._following = False
+
+tel = "T,1000,55,4095,850,850,4095,0,6,0,0,0,-35,%d,%d,%d" % (4 | 32, 25, 47)
+app._handle_line(tel)
+settle(0.05)
+check(app._following and app.follow_btn.cget("text") == "Stop follow",
+      "telemetry flag bit5 flips the button (%r)" % app.follow_btn.cget("text"))
+label = app.line_label.cget("text")
+check("follow:" in label and "+0.25" in label and "47 Hz" in label,
+      "the tracker panel shows the live offset + read rate (%r)" % label)
+app._handle_line("T,1100,55,4095,850,850,4095,0,6,0,0,0,-35,%d,%d,%d" % (4, 0, 0))
+settle(0.05)
+check(app._following is False and app.follow_btn.cget("text") == "Follow line",
+      "and it goes back when the bot stops following")
+
 # ---- typing mode: keys are ignored while a text field has focus ---------------
 sent[:] = []
 app.root.focus_force()

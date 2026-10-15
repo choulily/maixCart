@@ -268,6 +268,7 @@ One command per line, from the GUI to the bot:
 | `speed <0-100>` | default drive speed |
 | `brake <0\|1> [duty] [ms]` | engage/disengage the **fast brake**: a reverse pulse (default duty 40, 90 ms) the moment a movement stops, applied by the firmware so it needs no round trip; `stop`, the watchdog and the optional timeout use it, E-STOP never does |
 | `motor <A-D> <f\|r\|stop> [speed]` | drive ONE wheel only (wiring/polarity test; same watchdog as `move`) |
+| `follow <0\|1> [speed] [flip]` | **line following**: the firmware reads the IR tracker and steers the wheels itself (`follow 1` needs the line under the sensor; `flip` = 1 mirrors the sensor order, speed = forward duty) |
 | `thr <n>` | tracker "on the line" threshold (ADC below n = black) |
 | `tel` / `ping` | ask for telemetry / heartbeat (`P,<ms>` comes back) |
 
@@ -275,13 +276,82 @@ Lines from the bot:
 
 ```
 L,hello ip=… fw=… sonar=(31, 30) servos={…} grab=40 open=-35   boot banner, once per connect
-T,<ms>,<dist>,<c0>,<c1>,<c2>,<c3>,<c4>,<onmask>,<ba>,<la>,<rot>,<cl>,<flags>   ~5x per second
+T,<ms>,<dist>,<c0>,<c1>,<c2>,<c3>,<c4>,<onmask>,<ba>,<la>,<rot>,<cl>,<flags>,<err>,<hz>   ~5x per second
 E,<text>    command/parse error          L,<text>    bot log line        P,<ms>   ping reply
 ```
 
 `dist` is cm (`-1` = no echo).  `onmask` bit *i* = tracker channel *i* is on the
 line.  `flags`: bit0 = estop latched, bit1 = ultrasonic sensor present,
-bit2 = tracker read ok, bit3 = WiFi connected, bit4 = fast brake engaged.
+bit2 = tracker read ok, bit3 = WiFi connected, bit4 = fast brake engaged,
+bit5 = line following.  `err` is the follower's line offset in channel units
+(times 100, + = the line is to the cart's right) and `hz` the tracker read rate.
+
+## Line following / 寻迹
+
+`follow 1` (or the GUI's **Follow line** button) hands the wheels to a controller
+that runs *in the firmware*: it reads the 4 tracker channels over the ESP32 SPI
+link and steers with `apply_mix()` some tens of times a second.  That is the
+whole point of having it on the cart - a GUI-side controller would be limited by
+the WiFi round trip (~20-500 ms), which is far too slow to stay on a line.
+
+How it steers: each channel that sees black pulls the line estimate its way,
+weighted by how black it is, giving an offset in "channel units" (-1.5 = the
+line is under the leftmost sensor, 0 = centred, +1.5 = rightmost).  A PD term
+turns that offset into a strafe/spin blend (`FOLLOW_MIX_Y` / `FOLLOW_MIX_W`), so
+the cart crabs back onto the line and also turns into it.  A wide 5 cm strip
+covering the whole sensor row reads as "centred", which is correct; the useful
+error band is where the outer sensors start leaving the strip.
+
+* **Start**: put the cart on the strip, sensor row over the line, then press
+  **Follow line** (`follow 1 [speed] [flip]`).  The bot refuses to start if no
+  channel sees the line - that is deliberate, so a stray click cannot send the
+  cart driving off.
+* **Stop**: the same button (`follow 0`), any manual drive input (pad/keyboard/
+  gamepad - it takes the wheels back), `stop`, or E-STOP.  Any stop, the
+  watchdog or the fast brake also ends following.
+* **End of line**: if the strip disappears from under the sensor for
+  `FOLLOW_LOST_MS` (400 ms) the cart stops by itself and says `line lost - stopped`
+  in the GUI log.
+* **Safety**: the e-stop works exactly as always; if the WiFi link dies the bot
+  reconnects and the wheels stop (following does not survive the reconnect).
+* **Tuning** (constants at the top of `remote_bot.py`):
+  `FOLLOW_SPEED` (45, the GUI's "follow speed" box sends it),
+  `FOLLOW_KP` (30) / `FOLLOW_KD` (45) - correction per channel of offset and
+  damping, `FOLLOW_MIX_Y`/`FOLLOW_MIX_W` (0.6/0.4) - strafe vs spin,
+  `FOLLOW_MIN_W` (160) - how dark a channel must read to count,
+  `FOLLOW_PERIOD_MS` (20) - control cycle.
+  Too much `FOLLOW_KP` = it snakes down the line; too little = it drifts off on
+  the first nudge.  `FOLLOW_KD` damps the snaking.
+* **Longer runs**: while following, the sonar ping is skipped (its 40 ms block
+  would hiccup the controller) and the tracker reading doubles as the telemetry
+  one.  The GUI's tracker panel shows `follow: offset +0.25, 47 Hz` - the offset
+  should stay near 0 and the Hz number tells you how fast the SPI read really is
+  on your cart.
+
+### First run checklist (what to look at on the cart)
+
+The test track right now: two A2 white boards in a row with a ~5 cm black tape
+strip straight down the middle - so "staying on the line" means the strip stays
+under the middle of the sensor row, and the run ends when the tape does.
+
+1. Upload the bot, restart the GUI, put the cart on the white board with the
+   sensor row over the black strip, in the middle of the track pointing along it.
+2. Check the tracker panel: the channels over the strip must show ~850 and go
+   red/ON (idle white ≈ 4095).  This also tells you the sensor order: slide the
+   cart sideways so the strip is under the **left** half of the sensor row and
+   note which channel lights up (`c0` = left as shipped).  If the panel's
+   "left/right" text disagrees with reality, tick **mirror sensors** (that is
+   `FOLLOW_FLIP`, and it can be changed while running).
+   Worth writing down for the tuning: the `c0…c3` numbers with the sensor over
+   (a) the black strip, (b) the white board, (c) the floor - the floor matters,
+   because if it reads below the threshold the cart will think a strip is there
+   when it runs off the edge of the board.
+3. Press **Follow line** with a low "follow speed" (30-45).  The cart should
+   drive along the strip and stop when the strip ends.
+4. Report back: the log lines, the `follow: offset … Hz` reading, and what the
+   cart did - stayed on the line / snaked (too much `FOLLOW_KP`) / drifted off
+   (too little, or the sensors mirrored) / stopped early (`FOLLOW_SPEED` too low
+   for the ramp, or `FOLLOW_MIN_W` too high for this floor and tape).
 
 ## Fast brake / 快速刹车
 
@@ -320,6 +390,9 @@ All in the `config` block at the top of `remote_bot.py`:
   (reverse, forward) as in `movement_reference.md`.
 * `SERVO_LIMITS`, `SERVO_HOME`, `GRAB_DEG`, `OPEN_DEG`, `SERVO_STEP_DEG`, `SPEED`.
 * `TRACKER_THRESH` (2000), `WATCHDOG_MS` (600), `TELEMETRY_MS` (200).
+* line following: `FOLLOW_SPEED` (45), `FOLLOW_KP` (30), `FOLLOW_KD` (45),
+  `FOLLOW_MIX_Y`/`FOLLOW_MIX_W` (0.6/0.4), `FOLLOW_MIN_W` (160),
+  `FOLLOW_LOST_MS` (400), `FOLLOW_PERIOD_MS` (20), `FOLLOW_FLIP` (False).
 
 ### Wheel polarity / 轮子方向 (this cart is mirrored)
 

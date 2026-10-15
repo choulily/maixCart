@@ -12,7 +12,7 @@ Usage:
 import base64, sys, time
 import serial
 
-PORT = "/dev/ttyUSB1"
+PORT = "/dev/ttyUSB0"
 BAUD = 115200
 
 
