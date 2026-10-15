@@ -35,6 +35,7 @@ import queue
 import select
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -54,6 +55,9 @@ else:
     _UPLOAD_IMPORT_ERROR = None
 
 SETTINGS = os.path.join(HERE, ".remote_gui.json")
+AP_SCRIPT = os.path.join(HERE, "cart_ap.sh")   # laptop hotspot (tools/cart_ap.sh)
+AP_SSID = "MaixCart-AP"
+AP_PASS = "maixcart123"
 
 # ---------------------------------------------------------------- protocol ---
 TELEMETRY_FIELDS = ("ms", "dist", "c0", "c1", "c2", "c3", "c4", "onmask",
@@ -592,6 +596,8 @@ class App:
         self._last_servo_key = {}
         self._wifi_ok = False
         self._brake_ok = False
+        self._ap_busy = False
+        self._ap_on = False
         self.log_keys = tk.BooleanVar(value=bool(cfg.get("log_keys", False)))
         self.fast_brake = tk.BooleanVar(value=bool(cfg.get("fast_brake", True)))
         self.pad_deadzone = float(cfg.get("pad_deadzone", PAD_DEADZONE))
@@ -682,7 +688,9 @@ class App:
         ttk.Label(wifi, text="pass").pack(side="left")
         self._field(ttk.Entry(wifi, textvariable=self.password, width=14)).pack(side="left", padx=(4, 8))
         ttk.Label(wifi, text="this laptop (bot connects to)").pack(side="left")
-        self._field(ttk.Entry(wifi, textvariable=self.host, width=16)).pack(side="left", padx=(4, 0))
+        self._field(ttk.Entry(wifi, textvariable=self.host, width=16)).pack(side="left", padx=(4, 8))
+        self.ap_btn = ttk.Button(wifi, text="Laptop AP", command=self._ap_clicked)
+        self.ap_btn.pack(side="left")
 
         # ---- middle: sensors + arm ----
         mid = ttk.Frame(root, padding=(8, 4))
@@ -930,6 +938,33 @@ class App:
             self.link.events.put(("err", "upload failed: %r" % (e,)))
         finally:
             self.link.events.put(("upload_done", None))
+
+    # ------------------------------------------------------- laptop AP ---
+    def _ap_clicked(self):
+        """Start/stop the laptop hotspot (tools/cart_ap.sh)."""
+        if self._ap_busy:
+            return
+        self._ap_busy = True
+        self.ap_btn.state(["disabled"])
+        threading.Thread(target=self._ap_worker,
+                         args=("stop" if self._ap_on else "start",), daemon=True).start()
+
+    def _ap_worker(self, action):
+        """Run the hotspot script off the Tk thread and report in the log."""
+        def log(msg, tag="info"):
+            self.link.events.put((tag, msg))
+        try:
+            out = subprocess.run([AP_SCRIPT, action], capture_output=True,
+                                 text=True, timeout=90)
+            text = (out.stdout + out.stderr).strip() or ("ok" if out.returncode == 0 else "no output")
+            for line in text.splitlines():
+                log("ap: " + line, "ok" if out.returncode == 0 else "err")
+            if out.returncode == 0 and action == "start":
+                self.link.events.put(("ap_up", None))
+            self.link.events.put(("ap_done", out.returncode == 0 and action == "start"))
+        except Exception as e:
+            log("cannot run %s: %r" % (AP_SCRIPT, e), "err")
+            self.link.events.put(("ap_done", None))
 
     def _stop_bot(self):
         if upload_bot is None:
@@ -1321,6 +1356,21 @@ class App:
                 elif kind == "upload_done":
                     self._uploading = False
                     self.upload_btn.state(["!disabled"])
+                elif kind == "ap_up":
+                    self.ssid.set(AP_SSID)          # the fields the uploader uses
+                    self.password.set(AP_PASS)
+                    if upload_bot is not None:
+                        self._lan_ip = upload_bot.lan_ip()
+                        self._lan_ip_at = time.time()
+                        self.host.set(self._lan_ip)
+                    self.log("laptop AP is up - WiFi fields set to %r, this laptop %s;"
+                             " now press 'Upload & run on cart'"
+                             % (AP_SSID, self.host.get()), "ok")
+                elif kind == "ap_done":
+                    self._ap_busy = False
+                    self._ap_on = bool(payload)
+                    self.ap_btn.configure(text="Stop AP" if self._ap_on else "Laptop AP")
+                    self.ap_btn.state(["!disabled"])
         except queue.Empty:
             pass
         try:

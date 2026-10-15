@@ -27,6 +27,40 @@ the GUI shows it.
 The cart does **nothing** on power-up until you press Upload (the program lives
 in RAM, see *Why RAM?* below), so press it again after every reset or power-up.
 
+## Which network? / 用哪种连接方式
+
+The cart needs a 2.4 GHz network it can reach the laptop on.  Three options:
+
+**1. Phone hotspot (the classic way)** - both the laptop and the cart join the
+phone's 2.4 GHz hotspot.  Works everywhere, but the phone is an extra hop, its
+power saving adds latency and it drops out when the phone sleeps or walks away.
+
+**2. Laptop AP (recommended for driving)** - the laptop becomes the access
+point and the cart connects to it **directly**, so there is no phone in the
+path.  One click in the GUI: press **Laptop AP** (next to the address field) -
+it starts a 2.4 GHz hotspot, fills the WiFi fields with its SSID/password,
+updates the "this laptop" address and logs the next step; then press
+**Upload & run on cart** and the cart joins the laptop.  Press **Stop AP** to go
+back.  Without the GUI: `tools/cart_ap.sh start|stop|status`
+(SSID `MaixCart-AP`, password `maixcart123`, overridable with
+`CART_AP_SSID`/`CART_AP_PASS`).
+Caveat: while the AP runs on the laptop's only WiFi card it cannot also be a
+client of the phone hotspot - the laptop has no internet unless Ethernet is
+plugged in (or a second WiFi adapter is used).
+
+**3. Bluetooth** - not used here, and not a quick change: the cart's ESP32 runs
+Sipeed's WiFi + tracker-ADC firmware over an SPI link to the K210, so it has no
+Bluetooth stack, and replacing that firmware would lose the WiFi link *and* the
+tracker ADC bridge.  A separate BT-serial module (e.g. HC-05) on a free K210
+UART plus an `rfcomm`-to-TCP bridge on the laptop would work, but it needs extra
+hardware and wiring - the laptop AP gives most of the benefit with none.  (The
+*controller* being Bluetooth is a different thing and already works - see the
+gamepad section.)
+
+If the link does drop while driving: the cart's watchdog stops the wheels, the
+bot reconnects on its own when the network comes back, and the GUI keeps
+listening, so re-uploading is only needed after a reset/power-up.
+
 ## Keyboard / 按键
 
 | Keys | Action |

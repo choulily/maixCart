@@ -206,6 +206,26 @@ root.event_generate("<FocusOut>", when="now")
 settle(0.3)
 check("stop" in sent, "FocusOut (window loses focus) sends 'stop'")
 
+# ---- laptop AP button re-points the WiFi fields at the hotspot ----------------
+class _FakeRun:
+    returncode = 0
+    stdout = "laptop AP 'MaixCart-AP' up on wlp3s0 (2.4 GHz)\n  this laptop: 10.42.0.1"
+    stderr = ""
+
+
+_real_run = rg.subprocess.run
+rg.subprocess.run = lambda *a, **kw: _FakeRun()
+try:
+    app._ap_worker("start")
+    settle(0.2)
+finally:
+    rg.subprocess.run = _real_run
+check(app.ssid.get() == rg.AP_SSID and app.password.get() == rg.AP_PASS,
+      "AP start fills in the hotspot SSID/password (%r/%r)" % (app.ssid.get(), app.password.get()))
+check(app.ap_btn.cget("text") == "Stop AP", "the button turns into 'Stop AP'")
+check("laptop AP is up" in app.logbox.get("1.0", "end"),
+      "the log tells you to press Upload next")
+
 print()
 print("FAILED: %d" % len(fails))
 for f in fails:
